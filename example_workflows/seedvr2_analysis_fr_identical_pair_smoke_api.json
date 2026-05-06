@@ -1,0 +1,25 @@
+{
+  "1": {
+    "inputs": {
+      "file": "issue175_baseline/UDM10_BDx4_001.mp4"
+    },
+    "class_type": "LoadVideo",
+    "_meta": {"title": "Source video — feeds output_video"}
+  },
+  "2": {
+    "inputs": {
+      "file": "issue175_baseline/UDM10_BDx4_001.mp4"
+    },
+    "class_type": "LoadVideo",
+    "_meta": {"title": "Same source — feeds reference_video for identical-pair FR sanity"}
+  },
+  "3": {
+    "inputs": {
+      "output_video": ["1", 0],
+      "reference_video": ["2", 0],
+      "lpips_backbone": "alex"
+    },
+    "class_type": "SeedVR2Analysis",
+    "_meta": {"title": "SeedVR2 Analysis — FR identical-pair (PSNR>50/inf, SSIM>0.99, LPIPS<0.01, DISTS<0.01)"}
+  }
+}

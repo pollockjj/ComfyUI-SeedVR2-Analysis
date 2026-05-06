@@ -1,0 +1,16 @@
+{
+  "1": {
+    "inputs": {
+      "file": "issue175_baseline/UDM10_BDx4_001.mp4"
+    },
+    "class_type": "LoadVideo",
+    "_meta": {"title": "Source LR video (NR-only smoke input)"}
+  },
+  "2": {
+    "inputs": {
+      "output_video": ["1", 0]
+    },
+    "class_type": "SeedVR2Analysis",
+    "_meta": {"title": "SeedVR2 Analysis — NR only (no reference_video supplied)"}
+  }
+}

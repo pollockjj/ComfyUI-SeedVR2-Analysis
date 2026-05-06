@@ -1,0 +1,59 @@
+[project]
+name = "comfyui-seedvr2-analysis"
+description = "SeedVR2-flavored video analysis node — takes one or two VIDEO inputs and emits a schema-versioned JSON of per-frame-aggregated metrics (PSNR / SSIM / LPIPS / DISTS / NIQE / MUSIQ / CLIP-IQA / DOVER). Inference-agnostic — the model that produced the input video is irrelevant."
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+authors = [
+    {name = "pollockjj"}
+]
+license = {text = "Apache-2.0"}
+classifiers = [
+    "Operating System :: OS Independent"
+]
+dependencies = [
+    "torch",
+    "torchvision",
+    "numpy",
+    "scipy",
+    "Pillow",
+    "tqdm",
+    "einops",
+    "matplotlib",
+    "opencv-python",
+    "scikit-video",
+    "timm",
+    "pyiqa==0.1.13",
+    "decord>=0.6.0,<0.7",
+    "openai-clip",
+    "setuptools<70",
+]
+
+[project.urls]
+Repository = "https://github.com/pollockjj/ComfyUI-SeedVR2-Analysis"
+
+[tool.comfy]
+PublisherId = "pollockjj"
+DisplayName = "ComfyUI-SeedVR2-Analysis"
+Icon = ""
+includes = []
+
+[tool.comfy.isolation]
+can_isolate = true
+share_torch = true
+package_manager = "uv"
+execution_model = "host-coupled"
+sandbox_mode = "disabled"
+share_torch_no_deps = [
+    "numpy",
+    "scipy",
+    "Pillow",
+    "tqdm",
+    "einops",
+    "matplotlib",
+    "opencv-python",
+    "scikit-video",
+    "timm",
+    "pyiqa",
+    "decord",
+    "openai-clip",
+]

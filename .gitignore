@@ -1,0 +1,15 @@
+# DOVER vendoring — operator-fetched, not tracked here
+# (see scripts/bootstrap_vendor.sh for setup steps)
+vendor/
+
+# Runtime artifacts
+outputs/
+*.json.tmp
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
