@@ -108,22 +108,36 @@ def _frames_from_video(video_obj_or_path: Any) -> tuple[Any, Fraction]:
             )
         return images.detach().contiguous(), frame_rate
 
-    # Fallback — bare string / Path. Uses decord locally (path must exist).
-    import decord
-    from decord import VideoReader
+    # Fallback — bare string / Path. PyAV (decord replacement, py313-compatible).
+    import av
+    import numpy as np
+    import torch as _torch
 
-    decord.bridge.set_bridge("torch")
     path_str = str(video_obj_or_path)
     if not Path(path_str).is_file():
         raise FileNotFoundError(f"video path does not exist: {path_str}")
-    vr = VideoReader(path_str)
-    n = len(vr)
-    if n == 0:
+    container = av.open(path_str)
+    try:
+        if not container.streams.video:
+            raise ValueError(f"video has no video stream: {path_str}")
+        stream = container.streams.video[0]
+        avg_rate = stream.average_rate
+        if avg_rate is None:
+            raise ValueError(
+                f"video has no average frame rate metadata: {path_str}"
+            )
+        fr = Fraction(avg_rate.numerator, avg_rate.denominator)
+        frames_np: list = []
+        for frame in container.decode(video=0):
+            frames_np.append(frame.to_ndarray(format="rgb24"))
+    finally:
+        container.close()
+    if not frames_np:
         raise ValueError(f"video has zero frames: {path_str}")
-    images = vr.get_batch(list(range(n)))  # (N, H, W, 3) uint8 torch tensor
-    images = images.to(dtype=__import__("torch").float32).div_(255.0).contiguous()
-    avg_fps = vr.get_avg_fps()
-    fr = Fraction(avg_fps).limit_denominator(1000)
+    images_u8 = np.stack(frames_np, axis=0)  # (N, H, W, 3) uint8
+    images = (
+        _torch.from_numpy(images_u8).to(dtype=_torch.float32).div_(255.0).contiguous()
+    )
     return images, fr
 
 
@@ -355,9 +369,9 @@ class SeedVR2MetricBackend:
                 "name": "pyiqa",
                 "version": _pkg_version("pyiqa"),
             },
-            "decord": {
-                "name": "decord",
-                "version": _pkg_version("decord"),
+            "av": {
+                "name": "av",
+                "version": _pkg_version("av"),
             },
             "torch": {
                 "name": "torch",
