@@ -59,6 +59,48 @@ VIDEO_ALIGNMENT_KEYS = ("frame_count", "frame_rate", "width", "height")
 SCHEMA_VERSION = "1.0"
 
 
+def _resolve_ffmpeg() -> str:
+    configured = os.environ.get("SEEDVR2_ANALYSIS_FFMPEG")
+    candidates: list[Path] = []
+    if configured:
+        candidates.append(Path(configured))
+
+    discovered = shutil.which("ffmpeg")
+    if discovered:
+        candidates.append(Path(discovered))
+
+    if os.name == "nt":
+        tools_root = Path("C:/Tools")
+        if tools_root.is_dir():
+            candidates.extend(tools_root.glob("**/ffmpeg.exe"))
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+
+    path_value = os.environ.get("PATH", "")
+    raise FileNotFoundError(
+        "ffmpeg executable not found. Set SEEDVR2_ANALYSIS_FFMPEG to the "
+        f"absolute ffmpeg path. PATH={path_value!r}"
+    )
+
+
+def _analysis_temp_dir() -> Path:
+    env_dir = os.environ.get("MYSOLATE_ARTIFACTS_DIR")
+    if env_dir:
+        root = Path(env_dir)
+    else:
+        try:
+            import folder_paths
+
+            root = Path(folder_paths.get_temp_directory())
+        except Exception:
+            root = REPO_ROOT / "outputs"
+    temp_dir = root / "seedvr2_analysis_tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    return temp_dir
+
+
 def _file_sha256(path: Path) -> str:
     h = sha256()
     with path.open("rb") as fp:
@@ -221,11 +263,15 @@ class SeedVR2MetricBackend:
             .contiguous()
             .numpy()
         )
-        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".mp4", prefix="seedvr2_analysis_")
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            suffix=".mp4",
+            prefix="seedvr2_analysis_",
+            dir=str(_analysis_temp_dir()),
+        )
         os.close(tmp_fd)
         tmp_path = Path(tmp_name)
         cmd = [
-            shutil.which("ffmpeg") or "ffmpeg",
+            _resolve_ffmpeg(),
             "-hide_banner",
             "-loglevel", "error",
             "-y",
@@ -342,7 +388,7 @@ class SeedVR2MetricBackend:
 
         import torch
 
-        ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+        ffmpeg_path = _resolve_ffmpeg()
         try:
             ff = subprocess.run(
                 [ffmpeg_path, "-version"], capture_output=True, text=True, check=True
@@ -352,17 +398,18 @@ class SeedVR2MetricBackend:
             ffmpeg_first_line = "unknown"
 
         dover_repo_sha = "unknown"
-        try:
-            rs = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=str(DOVER_ROOT),
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            dover_repo_sha = rs.stdout.strip()
-        except Exception:
-            pass
+        if (DOVER_ROOT / ".git").exists():
+            try:
+                rs = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=str(DOVER_ROOT),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                dover_repo_sha = rs.stdout.strip()
+            except Exception:
+                pass
 
         return {
             "pyiqa": {
