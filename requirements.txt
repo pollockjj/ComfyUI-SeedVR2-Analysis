@@ -1,0 +1,15 @@
+torch
+torchvision
+numpy
+scipy
+Pillow
+tqdm
+einops
+matplotlib
+opencv-python
+scikit-video
+timm
+pyiqa
+av
+openai-clip
+setuptools<70
