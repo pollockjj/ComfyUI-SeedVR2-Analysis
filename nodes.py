@@ -626,7 +626,11 @@ class SeedVR2Analysis:
         metrics_json. Preserves existing format tags (e.g. ComfyUI's `prompt`).
         Returns a result dict describing what happened."""
         ffmpeg = _resolve_ffmpeg()
-        tmp_out = source_path.with_suffix(source_path.suffix + ".analysis_tmp")
+        # Use the same extension as the source so ffmpeg can infer the muxer;
+        # pick a unique name to avoid collisions.
+        tmp_out = source_path.with_name(
+            f".{source_path.stem}.analysis_tmp.{uuid.uuid4().hex[:8]}{source_path.suffix}"
+        )
         cmd = [
             ffmpeg, "-y",
             "-i", str(source_path),
