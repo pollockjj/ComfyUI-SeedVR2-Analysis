@@ -792,9 +792,401 @@ class SeedVR2Analysis:
         return (metrics_json, str(artifact_path))
 
 
+EQUIVALENCE_SCHEMA_VERSION = "2.0"
+
+
+def _bayes_normal_posterior_decision(
+    diffs: list[float],
+    rope: float,
+    cred: float,
+) -> dict[str, Any]:
+    """Closed-form Bayesian-Normal posterior on the mean of paired differences.
+
+    Model: d_i ~ Normal(mu, sigma^2) with non-informative reference prior
+    p(mu, sigma) ~ 1/sigma. The marginal posterior on mu is then
+    Student-t(loc=mean(d), scale=std(d)/sqrt(n), df=n-1) — the conjugate
+    Bayesian counterpart of the frequentist paired t-test.
+
+    Decision rule (Kruschke):
+      - EQUIVALENT       : HDI ⊂ ROPE
+      - NOT_EQUIVALENT   : HDI ∩ ROPE = ∅
+      - UNDECIDED        : HDI partially in ROPE
+    """
+    import math
+    from statistics import fmean, stdev
+    from scipy import stats as scipy_stats
+
+    n = len(diffs)
+    if n < 2:
+        return {
+            "n_frames": n,
+            "mean_diff": diffs[0] if diffs else None,
+            "std_diff": None,
+            "se_diff": None,
+            "hdi_lo": None,
+            "hdi_hi": None,
+            "rope_lo": -abs(rope),
+            "rope_hi": abs(rope),
+            "p_in_rope": None,
+            "decision": "INSUFFICIENT_DATA",
+            "model": "Bayesian-Normal posterior on mu_diff (closed-form Student-t)",
+        }
+    m = fmean(diffs)
+    s = stdev(diffs)
+    se = s / math.sqrt(n)
+    df = n - 1
+    rope_lo = -abs(rope)
+    rope_hi = abs(rope)
+    if se == 0.0:
+        # Degenerate posterior: point mass at m. Decide directly.
+        in_rope = rope_lo <= m <= rope_hi
+        decision = "EQUIVALENT" if in_rope else "NOT_EQUIVALENT"
+        return {
+            "n_frames": n,
+            "mean_diff": m,
+            "std_diff": s,
+            "se_diff": se,
+            "hdi_lo": m,
+            "hdi_hi": m,
+            "rope_lo": rope_lo,
+            "rope_hi": rope_hi,
+            "p_in_rope": 1.0 if in_rope else 0.0,
+            "decision": decision,
+            "model": "Bayesian-Normal posterior on mu_diff (degenerate: zero variance)",
+        }
+    alpha = (1.0 - cred) / 2.0
+    # Student-t equal-tail interval; for symmetric Student-t this equals the HDI.
+    hdi_lo = scipy_stats.t.ppf(alpha, df=df, loc=m, scale=se)
+    hdi_hi = scipy_stats.t.ppf(1.0 - alpha, df=df, loc=m, scale=se)
+    p_lo = scipy_stats.t.cdf(rope_lo, df=df, loc=m, scale=se)
+    p_hi = scipy_stats.t.cdf(rope_hi, df=df, loc=m, scale=se)
+    p_in_rope = float(p_hi - p_lo)
+    if hdi_lo >= rope_lo and hdi_hi <= rope_hi:
+        decision = "EQUIVALENT"
+    elif hdi_hi < rope_lo or hdi_lo > rope_hi:
+        decision = "NOT_EQUIVALENT"
+    else:
+        decision = "UNDECIDED"
+    return {
+        "n_frames": n,
+        "mean_diff": m,
+        "std_diff": s,
+        "se_diff": se,
+        "hdi_lo": float(hdi_lo),
+        "hdi_hi": float(hdi_hi),
+        "rope_lo": rope_lo,
+        "rope_hi": rope_hi,
+        "p_in_rope": p_in_rope,
+        "decision": decision,
+        "model": "Bayesian-Normal posterior on mu_diff (closed-form Student-t)",
+    }
+
+
+class SeedVR2EquivalenceAnalysis:
+    """Three-video paired analysis with BEST-style ROPE equivalence testing.
+
+    Inputs:
+      - reference (optional): if supplied, FR metrics (PSNR/SSIM/LPIPS/DISTS)
+        are computed against (reference, video1) and (reference, video2)
+        and per-frame paired differences feed the equivalence test.
+      - video1, video2 (required): NR metrics (NIQE/MUSIQ/CLIP-IQA/DOVER)
+        are computed on each, paired across frames.
+    Per metric, paired per-frame differences (m1[i] - m2[i]) drive a
+    Bayesian-Normal posterior on the mean difference; HDI vs ROPE decides
+    EQUIVALENT / NOT_EQUIVALENT / UNDECIDED per Kruschke.
+    """
+
+    def __init__(self, metric_backend=None):
+        self._metric_backend = metric_backend
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video1": ("VIDEO",),
+                "video2": ("VIDEO",),
+            },
+            "optional": {
+                "reference": ("VIDEO",),
+                "lpips_backbone": (["alex", "vgg"], {"default": "alex"}),
+                # Metric toggles
+                "enable_psnr": ("BOOLEAN", {"default": True}),
+                "enable_ssim": ("BOOLEAN", {"default": True}),
+                "enable_lpips": ("BOOLEAN", {"default": True}),
+                "enable_dists": ("BOOLEAN", {"default": True}),
+                "enable_niqe": ("BOOLEAN", {"default": True}),
+                "enable_musiq": ("BOOLEAN", {"default": True}),
+                "enable_clip_iqa": ("BOOLEAN", {"default": True}),
+                "enable_dover": ("BOOLEAN", {"default": True}),
+                # ROPE half-widths (operator must justify these on prior grounds)
+                "rope_psnr": ("FLOAT", {"default": 0.10, "min": 0.0, "step": 0.01}),
+                "rope_ssim": ("FLOAT", {"default": 0.005, "min": 0.0, "step": 0.001}),
+                "rope_lpips": ("FLOAT", {"default": 0.005, "min": 0.0, "step": 0.001}),
+                "rope_dists": ("FLOAT", {"default": 0.005, "min": 0.0, "step": 0.001}),
+                "rope_niqe": ("FLOAT", {"default": 0.10, "min": 0.0, "step": 0.01}),
+                "rope_musiq": ("FLOAT", {"default": 1.00, "min": 0.0, "step": 0.1}),
+                "rope_clip_iqa": ("FLOAT", {"default": 0.02, "min": 0.0, "step": 0.001}),
+                "rope_dover": ("FLOAT", {"default": 0.02, "min": 0.0, "step": 0.001}),
+                "hdi_credibility": ("FLOAT", {"default": 0.95, "min": 0.50, "max": 0.999, "step": 0.01}),
+                "output_directory": ("STRING", {"default": ""}),
+                "output_filename": ("STRING", {"default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("metrics_json", "artifact_path", "overall_decision")
+    FUNCTION = "analyze"
+    CATEGORY = "video/analysis"
+    OUTPUT_NODE = True
+
+    @staticmethod
+    def _artifact_dir() -> Path:
+        try:
+            import folder_paths
+            return Path(folder_paths.get_output_directory()) / "seedvr2_analysis"
+        except Exception:
+            return REPO_ROOT / "outputs" / "seedvr2_analysis"
+
+    @staticmethod
+    def _alignment_metadata(frames_nhwc, frame_rate: Fraction) -> dict[str, Any]:
+        n, h, w, _ = frames_nhwc.shape
+        return {
+            "frame_count": int(n),
+            "frame_rate": str(frame_rate),
+            "width": int(w),
+            "height": int(h),
+        }
+
+    @classmethod
+    def _assert_alignment_pair(cls, a_meta, b_meta, label_a, label_b):
+        mismatches = []
+        for key in VIDEO_ALIGNMENT_KEYS:
+            a = a_meta[key]
+            b = b_meta[key]
+            if key == "frame_rate":
+                a = Fraction(a)
+                b = Fraction(b)
+            if a != b:
+                mismatches.append(key)
+        if mismatches:
+            raise ValueError(
+                f"alignment mismatch ({label_a} vs {label_b}): {', '.join(mismatches)}"
+            )
+
+    def _per_frame_nr(self, backend, frames_nhwc, frame_rate, enabled_nr) -> dict[str, list[float]]:
+        """Compute per-frame NR metric values (no aggregation)."""
+        out: dict[str, list[float]] = {}
+        if not enabled_nr:
+            return out
+        frames_chw = _to_pyiqa_input(frames_nhwc)
+        if "niqe" in enabled_nr:
+            out["niqe"] = list(map(float, backend._run_pyiqa_per_frame("niqe", frames_chw)))
+        if "musiq" in enabled_nr:
+            out["musiq"] = list(map(float, backend._run_pyiqa_per_frame("musiq", frames_chw)))
+        if "clip_iqa" in enabled_nr:
+            out["clip_iqa"] = list(map(float, backend._run_pyiqa_per_frame("clipiqa", frames_chw)))
+        if "dover_fused" in enabled_nr:
+            backend._require_dover()
+            tmp_video = backend._encode_frames_to_temp_mp4(frames_nhwc, frame_rate)
+            try:
+                out["dover_fused"] = [float(backend._run_dover_subprocess(tmp_video))]
+            finally:
+                tmp_video.unlink(missing_ok=True)
+        return out
+
+    def _per_frame_fr(self, backend, out_frames_nhwc, ref_frames_nhwc, enabled_fr) -> dict[str, list[float]]:
+        """Compute per-frame FR metric values (no aggregation)."""
+        out: dict[str, list[float]] = {}
+        if not enabled_fr:
+            return out
+        if out_frames_nhwc.shape != ref_frames_nhwc.shape:
+            raise ValueError(
+                f"FR pair tensor shape mismatch: out={tuple(out_frames_nhwc.shape)} "
+                f"ref={tuple(ref_frames_nhwc.shape)}"
+            )
+        out_chw = _to_pyiqa_input(out_frames_nhwc)
+        ref_chw = _to_pyiqa_input(ref_frames_nhwc)
+        if "psnr" in enabled_fr:
+            out["psnr"] = list(map(float, backend._run_pyiqa_per_frame("psnr", out_chw, ref_chw)))
+        if "ssim" in enabled_fr:
+            out["ssim"] = list(map(float, backend._run_pyiqa_per_frame("ssim", out_chw, ref_chw)))
+        if "lpips" in enabled_fr:
+            out["lpips"] = list(map(float, backend._run_pyiqa_per_frame(
+                "lpips", out_chw, ref_chw, net=backend._lpips_backbone
+            )))
+        if "dists" in enabled_fr:
+            out["dists"] = list(map(float, backend._run_pyiqa_per_frame("dists", out_chw, ref_chw)))
+        return out
+
+    @staticmethod
+    def _aggregate_block(per_frame: list[float], extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        block = _aggregate(per_frame)
+        if extra:
+            block.update(extra)
+        return block
+
+    def analyze(
+        self,
+        video1,
+        video2,
+        reference=None,
+        lpips_backbone: str = "alex",
+        enable_psnr: bool = True,
+        enable_ssim: bool = True,
+        enable_lpips: bool = True,
+        enable_dists: bool = True,
+        enable_niqe: bool = True,
+        enable_musiq: bool = True,
+        enable_clip_iqa: bool = True,
+        enable_dover: bool = True,
+        rope_psnr: float = 0.10,
+        rope_ssim: float = 0.005,
+        rope_lpips: float = 0.005,
+        rope_dists: float = 0.005,
+        rope_niqe: float = 0.10,
+        rope_musiq: float = 1.00,
+        rope_clip_iqa: float = 0.02,
+        rope_dover: float = 0.02,
+        hdi_credibility: float = 0.95,
+        output_directory: str = "",
+        output_filename: str = "",
+    ):
+        # Resolve enabled metric sets
+        enabled_fr: set[str] = set()
+        if enable_psnr:  enabled_fr.add("psnr")
+        if enable_ssim:  enabled_fr.add("ssim")
+        if enable_lpips: enabled_fr.add("lpips")
+        if enable_dists: enabled_fr.add("dists")
+        enabled_nr: set[str] = set()
+        if enable_niqe:     enabled_nr.add("niqe")
+        if enable_musiq:    enabled_nr.add("musiq")
+        if enable_clip_iqa: enabled_nr.add("clip_iqa")
+        if enable_dover:    enabled_nr.add("dover_fused")
+
+        ropes = {
+            "psnr": rope_psnr, "ssim": rope_ssim, "lpips": rope_lpips, "dists": rope_dists,
+            "niqe": rope_niqe, "musiq": rope_musiq, "clip_iqa": rope_clip_iqa, "dover_fused": rope_dover,
+        }
+
+        # Output destination
+        if output_directory.strip():
+            artifact_dir = Path(output_directory).expanduser().resolve()
+        else:
+            artifact_dir = self._artifact_dir()
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        if output_filename.strip():
+            fname = output_filename.strip()
+            if not fname.lower().endswith(".json"):
+                fname = fname + ".json"
+        else:
+            fname = f"seedvr2_equivalence_{uuid.uuid4().hex}.json"
+        artifact_path = artifact_dir / fname
+
+        # Load all videos + alignment
+        v1_frames, v1_fps = _frames_from_video(video1)
+        v2_frames, v2_fps = _frames_from_video(video2)
+        v1_meta = self._alignment_metadata(v1_frames, v1_fps)
+        v2_meta = self._alignment_metadata(v2_frames, v2_fps)
+        # NR pairing requires identical frame_count + frame_rate (paired across frames)
+        self._assert_alignment_pair(v1_meta, v2_meta, "video1", "video2")
+        ref_frames = ref_fps = ref_meta = None
+        run_fr = reference is not None and bool(enabled_fr)
+        if reference is not None:
+            ref_frames, ref_fps = _frames_from_video(reference)
+            ref_meta = self._alignment_metadata(ref_frames, ref_fps)
+            if run_fr:
+                self._assert_alignment_pair(ref_meta, v1_meta, "reference", "video1")
+                self._assert_alignment_pair(ref_meta, v2_meta, "reference", "video2")
+
+        backend = self._metric_backend or SeedVR2MetricBackend(lpips_backbone=lpips_backbone)
+
+        # Per-frame metric collection
+        v1_nr = self._per_frame_nr(backend, v1_frames, v1_fps, enabled_nr)
+        v2_nr = self._per_frame_nr(backend, v2_frames, v2_fps, enabled_nr)
+        v1_fr: dict[str, list[float]] = {}
+        v2_fr: dict[str, list[float]] = {}
+        if run_fr:
+            v1_fr = self._per_frame_fr(backend, v1_frames, ref_frames, enabled_fr)
+            v2_fr = self._per_frame_fr(backend, v2_frames, ref_frames, enabled_fr)
+
+        # Equivalence per metric (pair v1 vs v2 across frames)
+        eq_results: dict[str, Any] = {}
+        for k, vals1 in {**v1_fr, **v1_nr}.items():
+            vals2 = v2_fr.get(k) if k in v1_fr else v2_nr.get(k)
+            if vals2 is None or len(vals1) != len(vals2):
+                eq_results[k] = {
+                    "decision": "NOT_PAIRABLE",
+                    "n_v1": len(vals1),
+                    "n_v2": 0 if vals2 is None else len(vals2),
+                    "rope_lo": -abs(ropes.get(k, 0.0)),
+                    "rope_hi": abs(ropes.get(k, 0.0)),
+                }
+                continue
+            diffs = [a - b for a, b in zip(vals1, vals2)]
+            eq_results[k] = _bayes_normal_posterior_decision(diffs, ropes.get(k, 0.0), hdi_credibility)
+
+        # Overall decision
+        decisions = [r.get("decision") for r in eq_results.values()]
+        if not decisions:
+            overall = "NO_METRICS"
+        elif all(d == "EQUIVALENT" for d in decisions):
+            overall = "EQUIVALENT"
+        elif any(d == "NOT_EQUIVALENT" for d in decisions):
+            overall = "NOT_EQUIVALENT"
+        else:
+            overall = "UNDECIDED"
+
+        # Aggregated per-video stat blocks (mean/std/min/max/full per-frame)
+        v1_block = {
+            "fr": {k: self._aggregate_block(v) for k, v in v1_fr.items()},
+            "nr": {k: self._aggregate_block(v) for k, v in v1_nr.items()},
+        }
+        v2_block = {
+            "fr": {k: self._aggregate_block(v) for k, v in v2_fr.items()},
+            "nr": {k: self._aggregate_block(v) for k, v in v2_nr.items()},
+        }
+        if "lpips" in v1_block["fr"]:
+            v1_block["fr"]["lpips"]["backbone"] = backend._lpips_backbone
+        if "lpips" in v2_block["fr"]:
+            v2_block["fr"]["lpips"]["backbone"] = backend._lpips_backbone
+
+        metrics_doc = {
+            "schema_version": EQUIVALENCE_SCHEMA_VERSION,
+            "node": "SeedVR2EquivalenceAnalysis",
+            "inputs": {
+                "video1": (repr(type(video1).__name__) if _is_video_object(video1) else str(video1)),
+                "video2": (repr(type(video2).__name__) if _is_video_object(video2) else str(video2)),
+                "reference": (
+                    None if reference is None
+                    else (repr(type(reference).__name__) if _is_video_object(reference) else str(reference))
+                ),
+            },
+            "videos": {"video1": v1_meta, "video2": v2_meta, "reference": ref_meta},
+            "enabled_metrics": {
+                "fr": sorted(enabled_fr) if run_fr else [],
+                "nr": sorted(enabled_nr),
+            },
+            "rope_half_widths": {k: ropes[k] for k in sorted(ropes.keys())},
+            "metrics": {"video1": v1_block, "video2": v2_block},
+            "equivalence": {
+                "method": "Bayesian-Normal posterior on mu_diff (closed-form Student-t); HDI vs ROPE per Kruschke",
+                "hdi_credibility": hdi_credibility,
+                "results": eq_results,
+                "overall_decision": overall,
+            },
+            "tool_provenance": backend.tool_provenance,
+        }
+
+        metrics_json = json.dumps(metrics_doc, indent=2, sort_keys=True)
+        artifact_path.write_text(metrics_json, encoding="utf-8")
+        return (metrics_json, str(artifact_path), overall)
+
+
 NODE_CLASS_MAPPINGS = {
     "SeedVR2Analysis": SeedVR2Analysis,
+    "SeedVR2EquivalenceAnalysis": SeedVR2EquivalenceAnalysis,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2Analysis": "SeedVR2 Analysis",
+    "SeedVR2EquivalenceAnalysis": "SeedVR2 Equivalence Analysis (BEST + ROPE)",
 }
