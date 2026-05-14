@@ -58,6 +58,57 @@ VIDEO_ALIGNMENT_KEYS = ("frame_count", "frame_rate", "width", "height")
 
 SCHEMA_VERSION = "1.0"
 
+# Source of truth: scripts/bootstrap_vendor.sh. Keep in sync.
+DOVER_REPO_URL = "https://github.com/VQAssessment/DOVER.git"
+DOVER_PIN_SHA = "f1ddc96215bc7fbcf8f315c65d47905f339c3419"
+DOVER_WEIGHT_URL = "https://github.com/QualityAssessment/DOVER/releases/download/v0.1.0/DOVER.pth"
+DOVER_WEIGHT_SHA256 = "f4a42c0bbc94c94dd7409e7f40887d44c5c30314d1d09e7edf03cc35813b4838"
+
+
+def _bootstrap_dover_repo(dover_root: Path) -> None:
+    """Clone VQAssessment/DOVER at the pinned SHA into dover_root."""
+    dover_root.parent.mkdir(parents=True, exist_ok=True)
+    if not (dover_root / ".git").exists():
+        subprocess.run(
+            ["git", "clone", DOVER_REPO_URL, str(dover_root)],
+            check=True,
+        )
+    subprocess.run(["git", "-C", str(dover_root), "fetch", "origin"], check=True)
+    subprocess.run(
+        ["git", "-C", str(dover_root), "checkout", DOVER_PIN_SHA],
+        check=True,
+    )
+
+
+def _download_dover_weights(weight_path: Path) -> None:
+    """Download DOVER.pth to weight_path and verify sha256."""
+    import urllib.request
+
+    weight_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = weight_path.with_suffix(weight_path.suffix + ".partial")
+    with urllib.request.urlopen(DOVER_WEIGHT_URL) as resp, open(tmp_path, "wb") as f:
+        shutil.copyfileobj(resp, f)
+    observed = sha256(tmp_path.read_bytes()).hexdigest()
+    if observed != DOVER_WEIGHT_SHA256:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"DOVER.pth sha256 mismatch: expected {DOVER_WEIGHT_SHA256}, "
+            f"observed {observed}"
+        )
+    tmp_path.replace(weight_path)
+
+
+def _ensure_dover_vendor(
+    dover_root: Path,
+    script_path: Path,
+    weight_path: Path,
+) -> None:
+    """Idempotently bootstrap the vendored DOVER tree if missing."""
+    if not script_path.is_file():
+        _bootstrap_dover_repo(dover_root)
+    if not weight_path.is_file():
+        _download_dover_weights(weight_path)
+
 
 def _resolve_ffmpeg() -> str:
     configured = os.environ.get("SEEDVR2_ANALYSIS_FFMPEG")
@@ -205,13 +256,14 @@ class SeedVR2MetricBackend:
 
     @classmethod
     def _require_dover(cls) -> None:
+        _ensure_dover_vendor(DOVER_ROOT, cls.DOVER_SCRIPT_PATH, cls.DOVER_WEIGHTS_PATH)
         if not cls.DOVER_SCRIPT_PATH.is_file():
             raise FileNotFoundError(
-                f"DOVER script does not exist: {cls.DOVER_SCRIPT_PATH}"
+                f"DOVER script does not exist after bootstrap: {cls.DOVER_SCRIPT_PATH}"
             )
         if not cls.DOVER_WEIGHTS_PATH.is_file():
             raise FileNotFoundError(
-                f"DOVER weights do not exist: {cls.DOVER_WEIGHTS_PATH}"
+                f"DOVER weights do not exist after bootstrap: {cls.DOVER_WEIGHTS_PATH}"
             )
 
     @staticmethod
