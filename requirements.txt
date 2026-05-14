@@ -11,5 +11,6 @@ scikit-video
 timm
 pyiqa
 av
+decord
 openai-clip
 setuptools<70
