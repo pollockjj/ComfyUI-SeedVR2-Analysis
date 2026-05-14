@@ -792,7 +792,21 @@ class SeedVR2Analysis:
         return (metrics_json, str(artifact_path))
 
 
-EQUIVALENCE_SCHEMA_VERSION = "2.0"
+EQUIVALENCE_SCHEMA_VERSION = "2.1"
+
+# Direction: True iff higher metric value = better quality.
+# video1 is treated as the "candidate" (e.g. native); video2 is the "reference impl" (e.g. numz).
+# "worse" for the candidate means: lower on a higher-is-better metric, OR higher on a lower-is-better metric.
+METRIC_HIGHER_IS_BETTER = {
+    "psnr": True,
+    "ssim": True,
+    "musiq": True,
+    "clip_iqa": True,
+    "dover_fused": True,
+    "lpips": False,
+    "dists": False,
+    "niqe": False,
+}
 
 
 def _bayes_normal_posterior_decision(
@@ -879,6 +893,161 @@ def _bayes_normal_posterior_decision(
         "p_in_rope": p_in_rope,
         "decision": decision,
         "model": "Bayesian-Normal posterior on mu_diff (closed-form Student-t)",
+    }
+
+
+def _per_metric_non_inferiority(
+    eq_result: dict[str, Any],
+    rope: float,
+    higher_is_better: bool,
+) -> dict[str, Any]:
+    """Direction-aware non-inferiority computation built on top of the per-metric
+    Bayesian-Normal posterior. video1 (candidate) is non-inferior to video2
+    (reference impl) on this metric iff its worse-direction excess is bounded
+    by rope.
+
+    Returns:
+        worse_excess_mean: posterior-mean shittiness in raw units (0 if better-or-equal).
+        worse_excess_in_ropes: same, in ROPE-half-width units.
+        p_non_inferior: P(candidate not worse than reference by more than rope).
+        ni_decision: NON_INFERIOR / INFERIOR / UNDECIDED.
+    """
+    import math
+    from scipy import stats as scipy_stats
+
+    if eq_result.get("decision") in ("NOT_PAIRABLE", "INSUFFICIENT_DATA"):
+        return {
+            "worse_excess_mean": None,
+            "worse_excess_in_ropes": None,
+            "p_non_inferior": None,
+            "ni_decision": eq_result.get("decision", "UNDECIDED"),
+        }
+
+    m = eq_result["mean_diff"]
+    se = eq_result.get("se_diff")
+    n = eq_result["n_frames"]
+    # Worse-direction sign convention: define w = mean_diff in the direction
+    # where positive == candidate is worse than reference.
+    #   higher-is-better metric: worse when video1 < video2 -> w = -(v1 - v2) = -mean_diff
+    #   lower-is-better metric:  worse when video1 > video2 -> w = +(v1 - v2) = +mean_diff
+    w = -m if higher_is_better else m
+    rope_pos = abs(rope)
+    # Posterior-mean worse-excess: max(0, w) clipped (we only count how far candidate
+    # is worse than reference; better-or-equal contributes zero).
+    worse_excess_mean = float(max(0.0, w))
+    worse_excess_in_ropes = float(worse_excess_mean / rope_pos) if rope_pos > 0 else None
+
+    # P(non-inferior) = P(w <= rope) under the Student-t posterior on the mean diff.
+    # The posterior on w is Student-t with center = w, scale = se_diff, df = n-1
+    # (sign-flip is a shift of mean; scale unchanged).
+    if se is None or se == 0.0 or n < 2:
+        # Degenerate posterior at the point estimate. Decide by comparing to ROPE.
+        if worse_excess_mean <= rope_pos:
+            p_ni = 1.0
+            ni_decision = "NON_INFERIOR"
+        else:
+            p_ni = 0.0
+            ni_decision = "INFERIOR"
+        return {
+            "worse_excess_mean": worse_excess_mean,
+            "worse_excess_in_ropes": worse_excess_in_ropes,
+            "p_non_inferior": p_ni,
+            "ni_decision": ni_decision,
+            "model": "degenerate posterior (zero variance)",
+        }
+    df = n - 1
+    # P(w <= rope_pos) where w has Student-t(loc=w, scale=se, df=df)
+    p_ni = float(scipy_stats.t.cdf(rope_pos, df=df, loc=w, scale=se))
+    if p_ni >= 0.95:
+        ni_decision = "NON_INFERIOR"
+    elif p_ni <= 0.05:
+        ni_decision = "INFERIOR"
+    else:
+        ni_decision = "UNDECIDED"
+    return {
+        "worse_excess_mean": worse_excess_mean,
+        "worse_excess_in_ropes": worse_excess_in_ropes,
+        "p_non_inferior": p_ni,
+        "ni_decision": ni_decision,
+        "model": "Student-t posterior on worse-direction mu_diff",
+    }
+
+
+def _compute_joint_non_inferiority(
+    per_metric_eq: dict[str, dict[str, Any]],
+    ropes: dict[str, float],
+) -> dict[str, Any]:
+    """Combine per-metric non-inferiority into a joint cross-metric verdict.
+
+    Under independence (caveat noted), joint P(all metrics non-inferior) = product
+    of per-metric P_NI. Cumulative shittiness sums per-metric worse-excess in
+    ROPE-units across metrics -- captures Boss's 'all a little shittier ->
+    movie is a lot shittier' intuition.
+
+    Aggregate verdict mapping (loose, designed for the "is native at least as
+    good as numz" question):
+        NOT_INFERIOR : every per-metric ni_decision is NON_INFERIOR
+                       AND joint_p_non_inferior >= 0.50
+                       AND cumulative_worse_excess_in_ropes <= 1.0
+        INFERIOR     : any per-metric ni_decision == INFERIOR
+                       OR cumulative_worse_excess_in_ropes >= 3.0
+        UNDECIDED    : otherwise
+    """
+    import math
+
+    per_metric_ni: dict[str, dict[str, Any]] = {}
+    log_p_sum = 0.0
+    log_p_valid = True
+    cumulative_we = 0.0
+    cumulative_count = 0
+    any_inferior = False
+    all_non_inferior = True
+    for metric, eq in per_metric_eq.items():
+        direction = METRIC_HIGHER_IS_BETTER.get(metric)
+        if direction is None:
+            continue
+        rope = ropes.get(metric)
+        if rope is None:
+            continue
+        ni = _per_metric_non_inferiority(eq, rope, direction)
+        per_metric_ni[metric] = ni
+        if ni.get("ni_decision") == "INFERIOR":
+            any_inferior = True
+            all_non_inferior = False
+        elif ni.get("ni_decision") != "NON_INFERIOR":
+            all_non_inferior = False
+        p = ni.get("p_non_inferior")
+        if p is None:
+            log_p_valid = False
+        else:
+            # Floor to avoid log(0) blowing up the product on a single hard fail.
+            log_p_sum += math.log(max(p, 1e-12))
+        we = ni.get("worse_excess_in_ropes")
+        if we is not None:
+            cumulative_we += we
+            cumulative_count += 1
+    joint_p_ni = math.exp(log_p_sum) if log_p_valid else None
+
+    if any_inferior or cumulative_we >= 3.0:
+        verdict = "INFERIOR"
+    elif all_non_inferior and (joint_p_ni is None or joint_p_ni >= 0.50) and cumulative_we <= 1.0:
+        verdict = "NOT_INFERIOR"
+    else:
+        verdict = "UNDECIDED"
+
+    return {
+        "method": (
+            "Direction-aware per-metric non-inferiority on the worse-side Student-t "
+            "posterior tail; joint product under independence assumption "
+            "(caveat: metric posteriors are not actually independent — joint p is a "
+            "conservative anchor, not a calibrated joint probability)."
+        ),
+        "per_metric": per_metric_ni,
+        "joint_p_non_inferior": joint_p_ni,
+        "joint_log_p_non_inferior": log_p_sum if log_p_valid else None,
+        "cumulative_worse_excess_in_ropes": cumulative_we,
+        "cumulative_worse_excess_metric_count": cumulative_count,
+        "aggregate_verdict": verdict,
     }
 
 
@@ -1125,7 +1294,7 @@ class SeedVR2EquivalenceAnalysis:
             diffs = [a - b for a, b in zip(vals1, vals2)]
             eq_results[k] = _bayes_normal_posterior_decision(diffs, ropes.get(k, 0.0), hdi_credibility)
 
-        # Overall decision
+        # Overall (bidirectional) equivalence verdict
         decisions = [r.get("decision") for r in eq_results.values()]
         if not decisions:
             overall = "NO_METRICS"
@@ -1135,6 +1304,9 @@ class SeedVR2EquivalenceAnalysis:
             overall = "NOT_EQUIVALENT"
         else:
             overall = "UNDECIDED"
+
+        # Joint non-inferiority verdict (video1 candidate vs video2 reference impl)
+        joint_ni = _compute_joint_non_inferiority(eq_results, ropes)
 
         # Aggregated per-video stat blocks (mean/std/min/max/full per-frame)
         v1_block = {
@@ -1174,12 +1346,16 @@ class SeedVR2EquivalenceAnalysis:
                 "results": eq_results,
                 "overall_decision": overall,
             },
+            "joint_non_inferiority": joint_ni,
             "tool_provenance": backend.tool_provenance,
         }
 
         metrics_json = json.dumps(metrics_doc, indent=2, sort_keys=True)
         artifact_path.write_text(metrics_json, encoding="utf-8")
-        return (metrics_json, str(artifact_path), overall)
+        # Combined verdict surfaced as the third return for downstream nodes:
+        # "{equivalence_overall}|{aggregate_non_inferiority}"
+        combined = f"{overall}|{joint_ni.get('aggregate_verdict', 'UNDECIDED')}"
+        return (metrics_json, str(artifact_path), combined)
 
 
 NODE_CLASS_MAPPINGS = {
