@@ -1051,6 +1051,87 @@ def _compute_joint_non_inferiority(
     }
 
 
+def _render_equivalence_text_table(metrics_doc: dict) -> str:
+    inputs = metrics_doc.get("inputs", {}) or {}
+    videos = metrics_doc.get("videos", {}) or {}
+    eq = metrics_doc.get("equivalence", {}) or {}
+    joint = metrics_doc.get("joint_non_inferiority", {}) or {}
+    ropes = metrics_doc.get("rope_half_widths", {}) or {}
+    metrics = metrics_doc.get("metrics", {}) or {}
+    v1m = metrics.get("video1", {}) or {}
+    v2m = metrics.get("video2", {}) or {}
+
+    def _video_label(side: str) -> str:
+        v = videos.get(side, {}) or {}
+        fc = v.get("frame_count")
+        fr = v.get("frame_rate")
+        w = v.get("width")
+        h = v.get("height")
+        return f"{w}x{h}@{fr}fps, {fc} frames" if fc else "(unknown)"
+
+    def _mean_from(side_block: dict, family: str, name: str):
+        fam = side_block.get(family, {}) or {}
+        m = fam.get(name, {}) or {}
+        return m.get("mean")
+
+    metric_rows = [
+        ("psnr", "fr", "higher_is_better"),
+        ("ssim", "fr", "higher_is_better"),
+        ("lpips", "fr", "lower_is_better"),
+        ("dists", "fr", "lower_is_better"),
+        ("niqe", "nr", "lower_is_better"),
+        ("musiq", "nr", "higher_is_better"),
+        ("clip_iqa", "nr", "higher_is_better"),
+        ("dover_fused", "nr", "higher_is_better"),
+    ]
+
+    lines = []
+    lines.append("=" * 96)
+    lines.append("SeedVR2 Equivalence Analysis  —  video1 vs video2 (worse-direction non-inferiority)")
+    lines.append("=" * 96)
+    lines.append(f"video1 (subject):     {inputs.get('video1', '?')}   [{_video_label('video1')}]")
+    lines.append(f"video2 (reference):   {inputs.get('video2', '?')}   [{_video_label('video2')}]")
+    lines.append(f"reference (HQ):       {inputs.get('reference', '?')}   [{_video_label('reference')}]")
+    lines.append(f"HDI credibility:      {eq.get('hdi_credibility', '?')}")
+    lines.append(f"Aggregate (joint):    {joint.get('aggregate_verdict', '?')}    "
+                 f"cum worse-excess: {joint.get('cumulative_worse_excess_in_ropes', float('nan')):.3f} ROPE-units "
+                 f"(n_metrics={joint.get('cumulative_worse_excess_metric_count', 0)})")
+    lines.append(f"BEST overall:         {eq.get('overall_decision', '?')}")
+    lines.append("-" * 96)
+    header = f"{'metric':<12} {'NI verdict':<18} {'wer (ROPE)':>10} {'rope_hw':>10} {'v1_mean':>14} {'v2_mean':>14} {'v1 - v2':>14}"
+    lines.append(header)
+    lines.append("-" * 96)
+
+    per_metric_ni = joint.get("per_metric", {}) or {}
+    for name, family, _ in metric_rows:
+        pm = per_metric_ni.get(name, {}) or {}
+        ni = pm.get("ni_decision", "—")
+        wer = pm.get("worse_excess_in_ropes")
+        rope_hw = ropes.get(name)
+        v1_mean = _mean_from(v1m, family, name)
+        v2_mean = _mean_from(v2m, family, name)
+        def _fmt(x, w=14, p=4):
+            if x is None:
+                return f"{'—':>{w}}"
+            try:
+                return f"{float(x):>{w}.{p}f}"
+            except (TypeError, ValueError):
+                return f"{str(x):>{w}}"
+        diff = None
+        if v1_mean is not None and v2_mean is not None:
+            try:
+                diff = float(v1_mean) - float(v2_mean)
+            except (TypeError, ValueError):
+                diff = None
+        lines.append(
+            f"{name:<12} {ni:<18} {_fmt(wer, 10, 3)} {_fmt(rope_hw, 10, 4)} "
+            f"{_fmt(v1_mean, 14, 4)} {_fmt(v2_mean, 14, 4)} {_fmt(diff, 14, 4)}"
+        )
+
+    lines.append("=" * 96)
+    return "\n".join(lines) + "\n"
+
+
 class SeedVR2EquivalenceAnalysis:
     """Three-video paired analysis with BEST-style ROPE equivalence testing.
 
@@ -1352,6 +1433,10 @@ class SeedVR2EquivalenceAnalysis:
 
         metrics_json = json.dumps(metrics_doc, indent=2, sort_keys=True)
         artifact_path.write_text(metrics_json, encoding="utf-8")
+        try:
+            print(_render_equivalence_text_table(metrics_doc), flush=True)
+        except Exception:
+            pass
         # Combined verdict surfaced as the third return for downstream nodes:
         # "{equivalence_overall}|{aggregate_non_inferiority}"
         combined = f"{overall}|{joint_ni.get('aggregate_verdict', 'UNDECIDED')}"
