@@ -377,30 +377,45 @@ class SeedVR2MetricBackend:
         return float(match.group(1))
 
     def compute_nr_metrics(
-        self, frames_nhwc, frame_rate: Fraction
+        self,
+        frames_nhwc,
+        frame_rate: Fraction,
+        enabled: set[str] | None = None,
     ) -> dict[str, Any]:
-        self._require_dover()
-        frames_chw = _to_pyiqa_input(frames_nhwc)
-
+        if enabled is None:
+            enabled = set(NR_METRIC_NAMES)
         results: dict[str, Any] = {}
-        results["niqe"] = _aggregate(self._run_pyiqa_per_frame("niqe", frames_chw))
-        results["musiq"] = _aggregate(self._run_pyiqa_per_frame("musiq", frames_chw))
-        results["clip_iqa"] = _aggregate(
-            self._run_pyiqa_per_frame("clipiqa", frames_chw)
-        )
-
-        tmp_video = self._encode_frames_to_temp_mp4(frames_nhwc, frame_rate)
-        try:
-            results["dover_fused"] = self._run_dover_subprocess(tmp_video)
-        finally:
-            tmp_video.unlink(missing_ok=True)
+        if not enabled:
+            return results
+        frames_chw = _to_pyiqa_input(frames_nhwc)
+        if "niqe" in enabled:
+            results["niqe"] = _aggregate(self._run_pyiqa_per_frame("niqe", frames_chw))
+        if "musiq" in enabled:
+            results["musiq"] = _aggregate(self._run_pyiqa_per_frame("musiq", frames_chw))
+        if "clip_iqa" in enabled:
+            results["clip_iqa"] = _aggregate(
+                self._run_pyiqa_per_frame("clipiqa", frames_chw)
+            )
+        if "dover_fused" in enabled:
+            self._require_dover()
+            tmp_video = self._encode_frames_to_temp_mp4(frames_nhwc, frame_rate)
+            try:
+                results["dover_fused"] = self._run_dover_subprocess(tmp_video)
+            finally:
+                tmp_video.unlink(missing_ok=True)
         return results
 
     def compute_fr_metrics(
         self,
         out_frames_nhwc,
         ref_frames_nhwc,
+        enabled: set[str] | None = None,
     ) -> dict[str, Any]:
+        if enabled is None:
+            enabled = set(FR_METRIC_NAMES)
+        results: dict[str, Any] = {}
+        if not enabled:
+            return results
         if out_frames_nhwc.shape != ref_frames_nhwc.shape:
             raise ValueError(
                 f"FR pair tensor shape mismatch: "
@@ -409,23 +424,25 @@ class SeedVR2MetricBackend:
             )
         out_chw = _to_pyiqa_input(out_frames_nhwc)
         ref_chw = _to_pyiqa_input(ref_frames_nhwc)
-
-        results: dict[str, Any] = {}
-        results["psnr"] = _aggregate(
-            self._run_pyiqa_per_frame("psnr", out_chw, ref_chw)
-        )
-        results["ssim"] = _aggregate(
-            self._run_pyiqa_per_frame("ssim", out_chw, ref_chw)
-        )
-        lpips_per_frame = self._run_pyiqa_per_frame(
-            "lpips", out_chw, ref_chw, net=self._lpips_backbone
-        )
-        lpips_block = _aggregate(lpips_per_frame)
-        lpips_block["backbone"] = self._lpips_backbone
-        results["lpips"] = lpips_block
-        results["dists"] = _aggregate(
-            self._run_pyiqa_per_frame("dists", out_chw, ref_chw)
-        )
+        if "psnr" in enabled:
+            results["psnr"] = _aggregate(
+                self._run_pyiqa_per_frame("psnr", out_chw, ref_chw)
+            )
+        if "ssim" in enabled:
+            results["ssim"] = _aggregate(
+                self._run_pyiqa_per_frame("ssim", out_chw, ref_chw)
+            )
+        if "lpips" in enabled:
+            lpips_per_frame = self._run_pyiqa_per_frame(
+                "lpips", out_chw, ref_chw, net=self._lpips_backbone
+            )
+            lpips_block = _aggregate(lpips_per_frame)
+            lpips_block["backbone"] = self._lpips_backbone
+            results["lpips"] = lpips_block
+        if "dists" in enabled:
+            results["dists"] = _aggregate(
+                self._run_pyiqa_per_frame("dists", out_chw, ref_chw)
+            )
         return results
 
     @property
@@ -507,11 +524,28 @@ class SeedVR2Analysis:
             "optional": {
                 "reference_video": ("VIDEO",),
                 "lpips_backbone": (["alex", "vgg"], {"default": "alex"}),
+                # FR metric toggles (require reference_video)
+                "enable_psnr": ("BOOLEAN", {"default": True}),
+                "enable_ssim": ("BOOLEAN", {"default": True}),
+                "enable_lpips": ("BOOLEAN", {"default": True}),
+                "enable_dists": ("BOOLEAN", {"default": True}),
+                # NR metric toggles
+                "enable_niqe": ("BOOLEAN", {"default": True}),
+                "enable_musiq": ("BOOLEAN", {"default": True}),
+                "enable_clip_iqa": ("BOOLEAN", {"default": True}),
+                "enable_dover": ("BOOLEAN", {"default": True}),
+                # Output destination overrides (empty = default ComfyUI/output/seedvr2_analysis/seedvr2_analysis_<uuid>.json)
+                "output_directory": ("STRING", {"default": ""}),
+                "output_filename": ("STRING", {"default": ""}),
+                # Embed the metrics JSON into the output_video file's container metadata
+                "embed_in_source": ("BOOLEAN", {"default": False}),
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("metrics_artifact",)
+    # metrics_json: the full JSON string (so a downstream save-text node can chain)
+    # artifact_path: where it was written on disk
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("metrics_json", "artifact_path")
     FUNCTION = "analyze"
     CATEGORY = "video/analysis"
     OUTPUT_NODE = True
@@ -561,15 +595,107 @@ class SeedVR2Analysis:
             "mismatches": [],
         }
 
+    @staticmethod
+    def _resolve_source_path(video_obj) -> Path | None:
+        """Best-effort: return the on-disk file path backing a VIDEO object,
+        or None if the source is not a file (BytesIO, VideoFromComponents, ...)."""
+        if video_obj is None:
+            return None
+        getter = getattr(video_obj, "get_stream_source", None)
+        if callable(getter):
+            try:
+                src = getter()
+            except Exception:
+                return None
+            if isinstance(src, (str, Path)):
+                p = Path(src)
+                if p.is_file():
+                    return p
+        # Fallback: name-mangled private attr on VideoFromFile
+        for attr in ("_VideoFromFile__file", "file", "path", "_path"):
+            v = getattr(video_obj, attr, None)
+            if isinstance(v, (str, Path)):
+                p = Path(v)
+                if p.is_file():
+                    return p
+        return None
+
+    @staticmethod
+    def _embed_metrics_into_mp4(source_path: Path, metrics_json: str) -> dict[str, Any]:
+        """Remux source_path adding a `analysis_metrics` format-level tag containing
+        metrics_json. Preserves existing format tags (e.g. ComfyUI's `prompt`).
+        Returns a result dict describing what happened."""
+        ffmpeg = _resolve_ffmpeg()
+        tmp_out = source_path.with_suffix(source_path.suffix + ".analysis_tmp")
+        cmd = [
+            ffmpeg, "-y",
+            "-i", str(source_path),
+            "-c", "copy",
+            "-map_metadata", "0",
+            "-metadata", f"analysis_metrics={metrics_json}",
+            "-movflags", "+use_metadata_tags",
+            str(tmp_out),
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            tmp_out.unlink(missing_ok=True)
+            return {
+                "attempted": True,
+                "succeeded": False,
+                "target": str(source_path),
+                "error": e.stderr[-2000:] if e.stderr else str(e),
+            }
+        tmp_out.replace(source_path)
+        return {
+            "attempted": True,
+            "succeeded": True,
+            "target": str(source_path),
+            "tag": "analysis_metrics",
+        }
+
     def analyze(
         self,
         output_video,
         reference_video=None,
         lpips_backbone: str = "alex",
+        enable_psnr: bool = True,
+        enable_ssim: bool = True,
+        enable_lpips: bool = True,
+        enable_dists: bool = True,
+        enable_niqe: bool = True,
+        enable_musiq: bool = True,
+        enable_clip_iqa: bool = True,
+        enable_dover: bool = True,
+        output_directory: str = "",
+        output_filename: str = "",
+        embed_in_source: bool = False,
     ):
-        artifact_dir = self._artifact_dir()
+        # Resolve enabled metric sets from user toggles
+        enabled_fr: set[str] = set()
+        if enable_psnr:  enabled_fr.add("psnr")
+        if enable_ssim:  enabled_fr.add("ssim")
+        if enable_lpips: enabled_fr.add("lpips")
+        if enable_dists: enabled_fr.add("dists")
+        enabled_nr: set[str] = set()
+        if enable_niqe:     enabled_nr.add("niqe")
+        if enable_musiq:    enabled_nr.add("musiq")
+        if enable_clip_iqa: enabled_nr.add("clip_iqa")
+        if enable_dover:    enabled_nr.add("dover_fused")
+
+        # Resolve output destination
+        if output_directory.strip():
+            artifact_dir = Path(output_directory).expanduser().resolve()
+        else:
+            artifact_dir = self._artifact_dir()
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        artifact_path = artifact_dir / f"seedvr2_analysis_{uuid.uuid4().hex}.json"
+        if output_filename.strip():
+            fname = output_filename.strip()
+            if not fname.lower().endswith(".json"):
+                fname = fname + ".json"
+        else:
+            fname = f"seedvr2_analysis_{uuid.uuid4().hex}.json"
+        artifact_path = artifact_dir / fname
 
         out_frames, out_fps = _frames_from_video(output_video)
         out_meta = self._alignment_metadata(out_frames, out_fps)
@@ -584,19 +710,25 @@ class SeedVR2Analysis:
             "reference": None,
             "mismatches": [],
         }
-        if reference_video is not None:
+        # FR alignment only runs if reference is provided AND at least one FR metric is on
+        run_fr = reference_video is not None and bool(enabled_fr)
+        if run_fr:
             ref_frames, ref_fps = _frames_from_video(reference_video)
             ref_meta = self._alignment_metadata(ref_frames, ref_fps)
             alignment = self._assert_reference_alignment(out_meta, ref_meta)
+        elif reference_video is not None:
+            # Reference supplied but no FR metric enabled — capture metadata, skip alignment assert
+            ref_frames, ref_fps = _frames_from_video(reference_video)
+            ref_meta = self._alignment_metadata(ref_frames, ref_fps)
 
         backend = self._metric_backend or SeedVR2MetricBackend(
             lpips_backbone=lpips_backbone
         )
 
-        nr_metrics = backend.compute_nr_metrics(out_frames, out_fps)
+        nr_metrics = backend.compute_nr_metrics(out_frames, out_fps, enabled=enabled_nr) if enabled_nr else {}
         fr_metrics = (
-            backend.compute_fr_metrics(out_frames, ref_frames)
-            if ref_frames is not None
+            backend.compute_fr_metrics(out_frames, ref_frames, enabled=enabled_fr)
+            if run_fr
             else None
         )
 
@@ -622,6 +754,10 @@ class SeedVR2Analysis:
                 "reference": ref_meta,
             },
             "alignment": alignment,
+            "enabled_metrics": {
+                "fr": sorted(enabled_fr),
+                "nr": sorted(enabled_nr),
+            },
             "metrics": {
                 "nr": nr_metrics,
                 "fr": fr_metrics,
@@ -629,10 +765,27 @@ class SeedVR2Analysis:
             "tool_provenance": backend.tool_provenance,
         }
 
-        artifact_path.write_text(
-            json.dumps(metrics_doc, indent=2, sort_keys=True), encoding="utf-8"
-        )
-        return (str(artifact_path),)
+        metrics_json = json.dumps(metrics_doc, indent=2, sort_keys=True)
+        artifact_path.write_text(metrics_json, encoding="utf-8")
+
+        if embed_in_source:
+            source_path = self._resolve_source_path(output_video)
+            if source_path is None:
+                metrics_doc["embed_in_source"] = {
+                    "attempted": True,
+                    "succeeded": False,
+                    "target": None,
+                    "error": "output_video is not backed by a resolvable file path",
+                }
+            else:
+                metrics_doc["embed_in_source"] = self._embed_metrics_into_mp4(
+                    source_path, metrics_json
+                )
+            # Re-serialize so the JSON record reflects the embed attempt
+            metrics_json = json.dumps(metrics_doc, indent=2, sort_keys=True)
+            artifact_path.write_text(metrics_json, encoding="utf-8")
+
+        return (metrics_json, str(artifact_path))
 
 
 NODE_CLASS_MAPPINGS = {
