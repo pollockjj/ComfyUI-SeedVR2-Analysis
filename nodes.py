@@ -1204,8 +1204,9 @@ def _render_rev3_text_table(metrics_doc: dict) -> str:
         if not metric_scores:
             continue
         metric_perf = perf.get(name, {}) or {}
+        reference_score = None if name in {"psnr", "ssim", "lpips", "dists"} else metric_scores.get("reference")
         lines.append(
-            f"{_metric_label(name):<20} {_fmt(metric_scores.get('reference'))} "
+            f"{_metric_label(name):<20} {_fmt(reference_score)} "
             f"{_fmt(metric_scores.get('numz'))} {_fmt(metric_scores.get('native'))} "
             f"{_fmt(metric_scores.get('floor'))} "
             f"{_fmt_percent(metric_perf.get('numz'))} {_fmt_percent(metric_perf.get('native'), 18)}"
