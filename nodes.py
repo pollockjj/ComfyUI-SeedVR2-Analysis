@@ -55,6 +55,8 @@ DOVER_ROOT = REPO_ROOT / "vendor" / "DOVER"
 NR_METRIC_NAMES = ("niqe", "musiq", "clip_iqa", "dover_fused")
 FR_METRIC_NAMES = ("psnr", "ssim", "lpips", "dists")
 VIDEO_ALIGNMENT_KEYS = ("frame_count", "frame_rate", "width", "height")
+DOVER_SAMPLE_SEED = 5770521
+WEBP_DEFAULT_FRAME_RATE = Fraction(25, 1)
 
 SCHEMA_VERSION = "1.0"
 
@@ -181,6 +183,20 @@ def _is_video_object(obj: Any) -> bool:
     return callable(getattr(obj, "get_components", None))
 
 
+def _frames_from_webp(path: Path) -> tuple[Any, Fraction]:
+    import numpy as np
+    import torch
+    from PIL import Image, ImageSequence
+
+    im = Image.open(path)
+    frames_np = [np.asarray(frame.convert("RGB")) for frame in ImageSequence.Iterator(im)]
+    if not frames_np:
+        raise ValueError(f"WebP has zero frames: {path}")
+    images_u8 = np.stack(frames_np, axis=0)
+    images = torch.from_numpy(images_u8).to(dtype=torch.float32).div_(255.0).contiguous()
+    return images, WEBP_DEFAULT_FRAME_RATE
+
+
 def _frames_from_video(video_obj_or_path: Any) -> tuple[Any, Fraction]:
     """Return ``(images_tensor_NHWC_in_[0,1], frame_rate_Fraction)`` for
     either a ComfyUI VIDEO object or a string path. Tensor stays on CPU
@@ -207,8 +223,11 @@ def _frames_from_video(video_obj_or_path: Any) -> tuple[Any, Fraction]:
     import torch as _torch
 
     path_str = str(video_obj_or_path)
-    if not Path(path_str).is_file():
+    path = Path(path_str)
+    if not path.is_file():
         raise FileNotFoundError(f"video path does not exist: {path_str}")
+    if path.suffix.lower() == ".webp":
+        return _frames_from_webp(path)
     container = av.open(path_str)
     try:
         if not container.streams.video:
@@ -1132,6 +1151,52 @@ def _render_equivalence_text_table(metrics_doc: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _render_rev3_dover_text_table(metrics_doc: dict) -> str:
+    block = metrics_doc.get("rev3_dover", {}) or {}
+    videos = block.get("videos", {}) or {}
+    scores = block.get("scores", {}) or {}
+    raw = block.get("raw_percent_score", {}) or {}
+
+    def _video_label(side: str) -> str:
+        v = videos.get(side, {}) or {}
+        fc = v.get("frame_count")
+        fr = v.get("frame_rate")
+        w = v.get("width")
+        h = v.get("height")
+        return f"{w}x{h}@{fr}fps, {fc} frames" if fc else "(unknown)"
+
+    def _fmt(value, width=14, precision=4):
+        if value is None:
+            return f"{'--':>{width}}"
+        try:
+            return f"{float(value):>{width}.{precision}f}"
+        except (TypeError, ValueError):
+            return f"{'--':>{width}}"
+
+    lines = []
+    lines.append("=" * 96)
+    lines.append("SeedVR2 Rev3 DOVER Analysis  -  reference / floor / video1 / video2")
+    lines.append("=" * 96)
+    lines.append(f"reference (HQ):       {_video_label('reference')}")
+    lines.append(f"floor (ESRGAN):       {_video_label('floor')}")
+    lines.append(f"video1:               {_video_label('video1')}")
+    lines.append(f"video2:               {_video_label('video2')}")
+    lines.append("-" * 96)
+    lines.append(
+        f"{'metric':<14} {'reference':>14} {'floor':>14} "
+        f"{'video1':>14} {'video2':>14} {'video1_raw':>14} {'video2_raw':>14}"
+    )
+    lines.append("-" * 96)
+    lines.append(
+        f"{'dover_fused':<14} {_fmt(scores.get('reference'))} "
+        f"{_fmt(scores.get('floor'))} {_fmt(scores.get('video1'))} "
+        f"{_fmt(scores.get('video2'))} {_fmt(raw.get('video1'))} "
+        f"{_fmt(raw.get('video2'))}"
+    )
+    lines.append("=" * 96)
+    return "\n".join(lines) + "\n"
+
+
 class SeedVR2EquivalenceAnalysis:
     """Three-video paired analysis with BEST-style ROPE equivalence testing.
 
@@ -1158,6 +1223,7 @@ class SeedVR2EquivalenceAnalysis:
             },
             "optional": {
                 "reference": ("VIDEO",),
+                "floor_video": ("VIDEO",),
                 "lpips_backbone": (["alex", "vgg"], {"default": "alex"}),
                 # Metric toggles
                 "enable_psnr": ("BOOLEAN", {"default": True}),
@@ -1188,6 +1254,11 @@ class SeedVR2EquivalenceAnalysis:
     FUNCTION = "analyze"
     CATEGORY = "video/analysis"
     OUTPUT_NODE = True
+    _dover_evaluator = None
+    _dover_evaluator_device = None
+    _dover_evaluator_opt = None
+    _dover_tensor_registry: dict[str, Any] = {}
+    _dover_reader_patched = False
 
     @staticmethod
     def _artifact_dir() -> Path:
@@ -1275,11 +1346,199 @@ class SeedVR2EquivalenceAnalysis:
             block.update(extra)
         return block
 
+    @classmethod
+    def _ensure_dover_imported(cls):
+        if str(DOVER_ROOT) not in sys.path:
+            sys.path.insert(0, str(DOVER_ROOT))
+
+    @classmethod
+    def _ensure_dover_video_reader_patched(cls):
+        if cls._dover_reader_patched:
+            return
+        cls._ensure_dover_imported()
+        from dover.datasets import dover_datasets as _dd  # type: ignore
+
+        original_reader = _dd.VideoReader
+        registry = cls._dover_tensor_registry
+
+        class _TensorReader:
+            def __init__(self, sentinel_path):
+                key = str(sentinel_path)[len("tensor://"):]
+                self._frames = registry[key]
+
+            def __len__(self):
+                return int(self._frames.shape[0])
+
+            def __getitem__(self, idx):
+                return self._frames[int(idx)]
+
+        class _WebPReader:
+            def __init__(self, webp_path):
+                from PIL import Image, ImageSequence
+                import numpy as np
+                import torch
+
+                im = Image.open(str(webp_path))
+                frames_np = [
+                    np.asarray(frame.convert("RGB"))
+                    for frame in ImageSequence.Iterator(im)
+                ]
+                if not frames_np:
+                    raise ValueError(f"WebP has zero frames: {webp_path}")
+                self._frames = torch.from_numpy(np.stack(frames_np, axis=0)).to(
+                    dtype=torch.uint8
+                ).contiguous()
+
+            def __len__(self):
+                return int(self._frames.shape[0])
+
+            def __getitem__(self, idx):
+                return self._frames[int(idx)]
+
+        def _dispatch(path, *args, **kwargs):
+            path_str = str(path)
+            if path_str.startswith("tensor://"):
+                return _TensorReader(path_str)
+            if path_str.lower().endswith(".webp"):
+                return _WebPReader(path_str)
+            return original_reader(path, *args, **kwargs)
+
+        _dd.VideoReader = _dispatch
+        cls._dover_reader_patched = True
+
+    @classmethod
+    def _ensure_dover_evaluator(cls, device: str):
+        if cls._dover_evaluator is not None and cls._dover_evaluator_device == device:
+            return cls._dover_evaluator, cls._dover_evaluator_opt
+        import torch
+        import yaml
+
+        cls._ensure_dover_imported()
+        from dover.models import DOVER  # type: ignore
+
+        with open(DOVER_ROOT / "dover.yml", "r") as fp:
+            opt = yaml.safe_load(fp)
+        weights_path = (DOVER_ROOT / opt["test_load_path"]).resolve()
+        evaluator = DOVER(**opt["model"]["args"]).to(device)
+        evaluator.load_state_dict(torch.load(str(weights_path), map_location=device))
+        evaluator.eval()
+        cls._dover_evaluator = evaluator
+        cls._dover_evaluator_device = device
+        cls._dover_evaluator_opt = opt
+        return evaluator, opt
+
+    @staticmethod
+    def _seed_dover_sampler():
+        import random
+        import numpy as np
+        import torch
+
+        random.seed(DOVER_SAMPLE_SEED)
+        np.random.seed(DOVER_SAMPLE_SEED)
+        torch.manual_seed(DOVER_SAMPLE_SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(DOVER_SAMPLE_SEED)
+
+    @classmethod
+    def _score_dover_source(cls, source_path: str, device: str) -> float:
+        import math
+        import torch
+
+        cls._ensure_dover_video_reader_patched()
+        evaluator, opt = cls._ensure_dover_evaluator(device)
+        cls._ensure_dover_imported()
+        from dover.datasets import dover_datasets as _dd  # type: ignore
+        from dover.datasets import UnifiedFrameSampler  # type: ignore
+
+        dopt = opt["data"]["val-l1080p"]["args"]
+        temporal_samplers = {}
+        for stype, sopt in dopt["sample_types"].items():
+            if "t_frag" not in sopt:
+                temporal_samplers[stype] = UnifiedFrameSampler(
+                    sopt["clip_len"], sopt["num_clips"], sopt["frame_interval"]
+                )
+            else:
+                temporal_samplers[stype] = UnifiedFrameSampler(
+                    sopt["clip_len"] // sopt["t_frag"],
+                    sopt["t_frag"],
+                    sopt["frame_interval"],
+                    sopt["num_clips"],
+                )
+        cls._seed_dover_sampler()
+        views, _ = _dd.spatial_temporal_view_decomposition(
+            source_path, dopt["sample_types"], temporal_samplers
+        )
+        mean = torch.FloatTensor([123.675, 116.28, 103.53])
+        std = torch.FloatTensor([58.395, 57.12, 57.375])
+        for k, v in views.items():
+            num_clips = dopt["sample_types"][k].get("num_clips", 1)
+            views[k] = (
+                ((v.permute(1, 2, 3, 0) - mean) / std)
+                .permute(3, 0, 1, 2)
+                .reshape(v.shape[0], num_clips, -1, *v.shape[2:])
+                .transpose(0, 1)
+                .to(device)
+            )
+        with torch.no_grad():
+            results = [r.mean().item() for r in evaluator(views)]
+        x = (
+            (results[0] - 0.1107) / 0.07355 * 0.6104
+            + (results[1] + 0.08285) / 0.03774 * 0.3896
+        )
+        return float(1.0 / (1.0 + math.exp(-x)))
+
+    @classmethod
+    def _score_dover_frames(cls, frames_nhwc_float01, device: str) -> float:
+        import torch
+
+        frames_u8 = (
+            frames_nhwc_float01.detach().cpu().clamp(0.0, 1.0) * 255.0
+        ).to(dtype=torch.uint8).contiguous()
+        key = uuid.uuid4().hex
+        cls._dover_tensor_registry[key] = frames_u8
+        try:
+            return cls._score_dover_source(f"tensor://{key}", device)
+        finally:
+            cls._dover_tensor_registry.pop(key, None)
+
+    @classmethod
+    def _score_dover_input(cls, source, frames_nhwc_float01, device: str) -> float:
+        if isinstance(source, (str, Path)):
+            return cls._score_dover_source(str(source), device)
+        return cls._score_dover_frames(frames_nhwc_float01, device)
+
+    @staticmethod
+    def _rev3_dover_block(
+        ref_score: float,
+        floor_score: float,
+        video1_score: float,
+        video2_score: float,
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        reference_normal = abs(ref_score - floor_score)
+        video1_normal = abs(video1_score - floor_score)
+        video2_normal = abs(video2_score - floor_score)
+        normalized = {
+            "reference": reference_normal,
+            "video1": video1_normal,
+            "video2": video2_normal,
+        }
+        if reference_normal < 1e-9:
+            return normalized, {"video1": None, "video2": None}, True
+        return (
+            normalized,
+            {
+                "video1": video1_normal / reference_normal,
+                "video2": video2_normal / reference_normal,
+            },
+            False,
+        )
+
     def analyze(
         self,
         video1,
         video2,
         reference=None,
+        floor_video=None,
         lpips_backbone: str = "alex",
         enable_psnr: bool = True,
         enable_ssim: bool = True,
@@ -1312,6 +1571,11 @@ class SeedVR2EquivalenceAnalysis:
         if enable_musiq:    enabled_nr.add("musiq")
         if enable_clip_iqa: enabled_nr.add("clip_iqa")
         if enable_dover:    enabled_nr.add("dover_fused")
+        run_rev3_dover = floor_video is not None and reference is not None and enable_dover
+        if run_rev3_dover:
+            enabled_nr.discard("dover_fused")
+        if floor_video is not None and reference is None:
+            raise ValueError("floor_video requires reference for Rev3 DOVER analysis")
 
         ropes = {
             "psnr": rope_psnr, "ssim": rope_ssim, "lpips": rope_lpips, "dists": rope_dists,
@@ -1340,6 +1604,7 @@ class SeedVR2EquivalenceAnalysis:
         # NR pairing requires identical frame_count + frame_rate (paired across frames)
         self._assert_alignment_pair(v1_meta, v2_meta, "video1", "video2")
         ref_frames = ref_fps = ref_meta = None
+        floor_frames = floor_fps = floor_meta = None
         run_fr = reference is not None and bool(enabled_fr)
         if reference is not None:
             ref_frames, ref_fps = _frames_from_video(reference)
@@ -1347,6 +1612,12 @@ class SeedVR2EquivalenceAnalysis:
             if run_fr:
                 self._assert_alignment_pair(ref_meta, v1_meta, "reference", "video1")
                 self._assert_alignment_pair(ref_meta, v2_meta, "reference", "video2")
+        if floor_video is not None:
+            floor_frames, floor_fps = _frames_from_video(floor_video)
+            floor_meta = self._alignment_metadata(floor_frames, floor_fps)
+            self._assert_alignment_pair(ref_meta, floor_meta, "reference", "floor_video")
+            self._assert_alignment_pair(floor_meta, v1_meta, "floor_video", "video1")
+            self._assert_alignment_pair(floor_meta, v2_meta, "floor_video", "video2")
 
         backend = self._metric_backend or SeedVR2MetricBackend(lpips_backbone=lpips_backbone)
 
@@ -1437,6 +1708,47 @@ class SeedVR2EquivalenceAnalysis:
             print(_render_equivalence_text_table(metrics_doc), flush=True)
         except Exception:
             pass
+        if run_rev3_dover:
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(str(DOVER_ROOT))
+                print("[SeedVR2EquivalenceAnalysis] Rev3 DOVER scoring reference", flush=True)
+                ref_dover = self._score_dover_input(reference, ref_frames, "cuda")
+                print("[SeedVR2EquivalenceAnalysis] Rev3 DOVER scoring floor", flush=True)
+                floor_dover = self._score_dover_input(floor_video, floor_frames, "cuda")
+                print("[SeedVR2EquivalenceAnalysis] Rev3 DOVER scoring video1", flush=True)
+                video1_dover = self._score_dover_input(video1, v1_frames, "cuda")
+                print("[SeedVR2EquivalenceAnalysis] Rev3 DOVER scoring video2", flush=True)
+                video2_dover = self._score_dover_input(video2, v2_frames, "cuda")
+            finally:
+                os.chdir(prev_cwd)
+            normalized, raw_percent, denom_unstable = self._rev3_dover_block(
+                ref_dover,
+                floor_dover,
+                video1_dover,
+                video2_dover,
+            )
+            metrics_doc["rev3_dover"] = {
+                "formula": "raw_percent_score = abs(candidate - floor) / abs(reference - floor)",
+                "videos": {
+                    "reference": ref_meta,
+                    "floor": floor_meta,
+                    "video1": v1_meta,
+                    "video2": v2_meta,
+                },
+                "scores": {
+                    "reference": ref_dover,
+                    "floor": floor_dover,
+                    "video1": video1_dover,
+                    "video2": video2_dover,
+                },
+                "normalized_delta_from_floor": normalized,
+                "raw_percent_score": raw_percent,
+                "denominator_unstable": denom_unstable,
+            }
+            metrics_json = json.dumps(metrics_doc, indent=2, sort_keys=True)
+            artifact_path.write_text(metrics_json, encoding="utf-8")
+            print(_render_rev3_dover_text_table(metrics_doc), flush=True)
         # Combined verdict surfaced as the third return for downstream nodes:
         # "{equivalence_overall}|{aggregate_non_inferiority}"
         combined = f"{overall}|{joint_ni.get('aggregate_verdict', 'UNDECIDED')}"
