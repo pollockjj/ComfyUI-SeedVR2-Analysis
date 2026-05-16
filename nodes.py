@@ -1151,8 +1151,8 @@ def _render_equivalence_text_table(metrics_doc: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _render_rev3_dover_text_table(metrics_doc: dict) -> str:
-    block = metrics_doc.get("rev3_dover", {}) or {}
+def _render_rev3_text_table(metrics_doc: dict) -> str:
+    block = metrics_doc.get("rev3", {}) or {}
     videos = block.get("videos", {}) or {}
     scores = block.get("scores", {}) or {}
     raw = block.get("raw_percent_score", {}) or {}
@@ -1183,7 +1183,7 @@ def _render_rev3_dover_text_table(metrics_doc: dict) -> str:
 
     lines = []
     lines.append("=" * 96)
-    lines.append("SeedVR2 Rev3 DOVER Analysis  -  reference / numz / native / floor")
+    lines.append("SeedVR2 Rev3 Anchor Analysis  -  reference / numz / native / floor")
     lines.append("=" * 96)
     lines.append(f"reference (HQ):       {_video_label('reference')}")
     lines.append(f"numz:                 {_video_label('numz')}")
@@ -1195,12 +1195,17 @@ def _render_rev3_dover_text_table(metrics_doc: dict) -> str:
         f"{'native':>14} {'floor':>14} {'numz_pct':>14} {'native_pct':>14}"
     )
     lines.append("-" * 96)
-    lines.append(
-        f"{'dover_fused':<14} {_fmt(scores.get('reference'))} "
-        f"{_fmt(scores.get('numz'))} {_fmt(scores.get('native'))} "
-        f"{_fmt(scores.get('floor'))} {_fmt_percent(raw.get('numz'))} "
-        f"{_fmt_percent(raw.get('native'))}"
-    )
+    for name in ("niqe", "musiq", "clip_iqa", "dover_fused"):
+        metric_scores = scores.get(name)
+        if not metric_scores:
+            continue
+        metric_raw = raw.get(name, {}) or {}
+        lines.append(
+            f"{name:<14} {_fmt(metric_scores.get('reference'))} "
+            f"{_fmt(metric_scores.get('numz'))} {_fmt(metric_scores.get('native'))} "
+            f"{_fmt(metric_scores.get('floor'))} {_fmt_percent(metric_raw.get('numz'))} "
+            f"{_fmt_percent(metric_raw.get('native'))}"
+        )
     lines.append("=" * 96)
     return "\n".join(lines) + "\n"
 
@@ -1516,19 +1521,19 @@ class SeedVR2EquivalenceAnalysis:
         return cls._score_dover_frames(frames_nhwc_float01, device)
 
     @staticmethod
-    def _rev3_dover_block(
+    def _rev3_anchor_block(
         ref_score: float,
+        numz_score: float,
+        native_score: float,
         floor_score: float,
-        video1_score: float,
-        video2_score: float,
     ) -> tuple[dict[str, Any], dict[str, Any], bool]:
         reference_normal = abs(ref_score - floor_score)
-        video1_normal = abs(video1_score - floor_score)
-        video2_normal = abs(video2_score - floor_score)
+        numz_normal = abs(numz_score - floor_score)
+        native_normal = abs(native_score - floor_score)
         normalized = {
             "reference": reference_normal,
-            "numz": video1_normal,
-            "native": video2_normal,
+            "numz": numz_normal,
+            "native": native_normal,
             "floor": 0.0,
         }
         if reference_normal < 1e-9:
@@ -1536,11 +1541,26 @@ class SeedVR2EquivalenceAnalysis:
         return (
             normalized,
             {
-                "numz": 100.0 * video1_normal / reference_normal,
-                "native": 100.0 * video2_normal / reference_normal,
+                "numz": 100.0 * numz_normal / reference_normal,
+                "native": 100.0 * native_normal / reference_normal,
             },
             False,
         )
+
+    def _rev3_pyiqa_nr_score(
+        self,
+        backend,
+        frames_nhwc,
+        frame_rate,
+        metric_name: str,
+    ) -> float:
+        values = self._per_frame_nr(backend, frames_nhwc, frame_rate, {metric_name}).get(
+            metric_name,
+            [],
+        )
+        if not values:
+            raise ValueError(f"Rev3 metric produced no values: {metric_name}")
+        return float(sum(values) / len(values))
 
     def analyze(
         self,
@@ -1579,9 +1599,14 @@ class SeedVR2EquivalenceAnalysis:
         if enable_niqe:     enabled_nr.add("niqe")
         if enable_musiq:    enabled_nr.add("musiq")
         if enable_clip_iqa: enabled_nr.add("clip_iqa")
-        run_rev3_dover = floor_video is not None and reference is not None and enable_dover
+        rev3_enabled_nr: list[str] = []
+        if enable_niqe:     rev3_enabled_nr.append("niqe")
+        if enable_musiq:    rev3_enabled_nr.append("musiq")
+        if enable_clip_iqa: rev3_enabled_nr.append("clip_iqa")
+        if enable_dover:    rev3_enabled_nr.append("dover_fused")
+        run_rev3 = floor_video is not None and reference is not None and bool(rev3_enabled_nr)
         if floor_video is not None and reference is None:
-            raise ValueError("floor_video requires reference for Rev3 DOVER analysis")
+            raise ValueError("floor_video requires reference for Rev3 analysis")
 
         ropes = {
             "psnr": rope_psnr, "ssim": rope_ssim, "lpips": rope_lpips, "dists": rope_dists,
@@ -1714,27 +1739,51 @@ class SeedVR2EquivalenceAnalysis:
             print(_render_equivalence_text_table(metrics_doc), flush=True)
         except Exception:
             pass
-        if run_rev3_dover:
+        if run_rev3:
             prev_cwd = os.getcwd()
-            try:
-                os.chdir(str(DOVER_ROOT))
-                print("[SeedVR2EquivalenceAnalysis] Rev3 DOVER scoring reference", flush=True)
-                ref_dover = self._score_dover_input(reference, ref_frames, "cuda")
-                print("[SeedVR2EquivalenceAnalysis] Rev3 DOVER scoring floor", flush=True)
-                floor_dover = self._score_dover_input(floor_video, floor_frames, "cuda")
-                print("[SeedVR2EquivalenceAnalysis] Rev3 DOVER scoring numz", flush=True)
-                video1_dover = self._score_dover_input(video1, v1_frames, "cuda")
-                print("[SeedVR2EquivalenceAnalysis] Rev3 DOVER scoring native", flush=True)
-                video2_dover = self._score_dover_input(video2, v2_frames, "cuda")
-            finally:
-                os.chdir(prev_cwd)
-            normalized, raw_percent, denom_unstable = self._rev3_dover_block(
-                ref_dover,
-                floor_dover,
-                video1_dover,
-                video2_dover,
-            )
-            metrics_doc["rev3_dover"] = {
+            rev3_scores: dict[str, Any] = {}
+            rev3_normalized: dict[str, Any] = {}
+            rev3_raw_percent: dict[str, Any] = {}
+            rev3_denominator_unstable: dict[str, bool] = {}
+            for metric_name in rev3_enabled_nr:
+                if metric_name == "dover_fused":
+                    try:
+                        os.chdir(str(DOVER_ROOT))
+                        print("[SeedVR2EquivalenceAnalysis] Rev3 dover_fused scoring reference", flush=True)
+                        ref_score = self._score_dover_input(reference, ref_frames, "cuda")
+                        print("[SeedVR2EquivalenceAnalysis] Rev3 dover_fused scoring numz", flush=True)
+                        numz_score = self._score_dover_input(video1, v1_frames, "cuda")
+                        print("[SeedVR2EquivalenceAnalysis] Rev3 dover_fused scoring native", flush=True)
+                        native_score = self._score_dover_input(video2, v2_frames, "cuda")
+                        print("[SeedVR2EquivalenceAnalysis] Rev3 dover_fused scoring floor", flush=True)
+                        floor_score = self._score_dover_input(floor_video, floor_frames, "cuda")
+                    finally:
+                        os.chdir(prev_cwd)
+                else:
+                    print(f"[SeedVR2EquivalenceAnalysis] Rev3 {metric_name} scoring reference", flush=True)
+                    ref_score = self._rev3_pyiqa_nr_score(backend, ref_frames, ref_fps, metric_name)
+                    print(f"[SeedVR2EquivalenceAnalysis] Rev3 {metric_name} scoring numz", flush=True)
+                    numz_score = self._rev3_pyiqa_nr_score(backend, v1_frames, v1_fps, metric_name)
+                    print(f"[SeedVR2EquivalenceAnalysis] Rev3 {metric_name} scoring native", flush=True)
+                    native_score = self._rev3_pyiqa_nr_score(backend, v2_frames, v2_fps, metric_name)
+                    print(f"[SeedVR2EquivalenceAnalysis] Rev3 {metric_name} scoring floor", flush=True)
+                    floor_score = self._rev3_pyiqa_nr_score(backend, floor_frames, floor_fps, metric_name)
+                normalized, raw_percent, denom_unstable = self._rev3_anchor_block(
+                    ref_score,
+                    numz_score,
+                    native_score,
+                    floor_score,
+                )
+                rev3_scores[metric_name] = {
+                    "reference": ref_score,
+                    "numz": numz_score,
+                    "native": native_score,
+                    "floor": floor_score,
+                }
+                rev3_normalized[metric_name] = normalized
+                rev3_raw_percent[metric_name] = raw_percent
+                rev3_denominator_unstable[metric_name] = denom_unstable
+            metrics_doc["rev3"] = {
                 "formula": "raw_percent_score = 100 * abs(candidate - floor) / abs(reference - floor)",
                 "videos": {
                     "reference": ref_meta,
@@ -1742,19 +1791,14 @@ class SeedVR2EquivalenceAnalysis:
                     "native": v2_meta,
                     "floor": floor_meta,
                 },
-                "scores": {
-                    "reference": ref_dover,
-                    "numz": video1_dover,
-                    "native": video2_dover,
-                    "floor": floor_dover,
-                },
-                "normalized_delta_from_floor": normalized,
-                "raw_percent_score": raw_percent,
-                "denominator_unstable": denom_unstable,
+                "scores": rev3_scores,
+                "normalized_delta_from_floor": rev3_normalized,
+                "raw_percent_score": rev3_raw_percent,
+                "denominator_unstable": rev3_denominator_unstable,
             }
             metrics_json = json.dumps(metrics_doc, indent=2)
             artifact_path.write_text(metrics_json, encoding="utf-8")
-            print(_render_rev3_dover_text_table(metrics_doc), flush=True)
+            print(_render_rev3_text_table(metrics_doc), flush=True)
         # Combined verdict surfaced as the third return for downstream nodes:
         # "{equivalence_overall}|{aggregate_non_inferiority}"
         combined = f"{overall}|{joint_ni.get('aggregate_verdict', 'UNDECIDED')}"
