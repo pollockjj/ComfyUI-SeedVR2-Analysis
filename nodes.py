@@ -1183,23 +1183,23 @@ def _render_rev3_dover_text_table(metrics_doc: dict) -> str:
 
     lines = []
     lines.append("=" * 96)
-    lines.append("SeedVR2 Rev3 DOVER Analysis  -  reference / floor / video1 / video2")
+    lines.append("SeedVR2 Rev3 DOVER Analysis  -  reference / numz / native / floor")
     lines.append("=" * 96)
     lines.append(f"reference (HQ):       {_video_label('reference')}")
+    lines.append(f"numz:                 {_video_label('numz')}")
+    lines.append(f"native:               {_video_label('native')}")
     lines.append(f"floor (ESRGAN):       {_video_label('floor')}")
-    lines.append(f"video1:               {_video_label('video1')}")
-    lines.append(f"video2:               {_video_label('video2')}")
     lines.append("-" * 96)
     lines.append(
-        f"{'metric':<14} {'reference':>14} {'floor':>14} "
-        f"{'video1':>14} {'video2':>14} {'video1_pct':>14} {'video2_pct':>14}"
+        f"{'metric':<14} {'reference':>14} {'numz':>14} "
+        f"{'native':>14} {'floor':>14} {'numz_pct':>14} {'native_pct':>14}"
     )
     lines.append("-" * 96)
     lines.append(
         f"{'dover_fused':<14} {_fmt(scores.get('reference'))} "
-        f"{_fmt(scores.get('floor'))} {_fmt(scores.get('video1'))} "
-        f"{_fmt(scores.get('video2'))} {_fmt_percent(raw.get('video1'))} "
-        f"{_fmt_percent(raw.get('video2'))}"
+        f"{_fmt(scores.get('numz'))} {_fmt(scores.get('native'))} "
+        f"{_fmt(scores.get('floor'))} {_fmt_percent(raw.get('numz'))} "
+        f"{_fmt_percent(raw.get('native'))}"
     )
     lines.append("=" * 96)
     return "\n".join(lines) + "\n"
@@ -1212,7 +1212,7 @@ class SeedVR2EquivalenceAnalysis:
       - reference (optional): if supplied, FR metrics (PSNR/SSIM/LPIPS/DISTS)
         are computed against (reference, video1) and (reference, video2)
         and per-frame paired differences feed the equivalence test.
-      - video1, video2 (required): NR metrics (NIQE/MUSIQ/CLIP-IQA/DOVER)
+      - video1, video2 (required): NR metrics (NIQE/MUSIQ/CLIP-IQA)
         are computed on each, paired across frames.
     Per metric, paired per-frame differences (m1[i] - m2[i]) drive a
     Bayesian-Normal posterior on the mean difference; HDI vs ROPE decides
@@ -1527,16 +1527,17 @@ class SeedVR2EquivalenceAnalysis:
         video2_normal = abs(video2_score - floor_score)
         normalized = {
             "reference": reference_normal,
-            "video1": video1_normal,
-            "video2": video2_normal,
+            "numz": video1_normal,
+            "native": video2_normal,
+            "floor": 0.0,
         }
         if reference_normal < 1e-9:
-            return normalized, {"video1": None, "video2": None}, True
+            return normalized, {"numz": None, "native": None}, True
         return (
             normalized,
             {
-                "video1": 100.0 * video1_normal / reference_normal,
-                "video2": 100.0 * video2_normal / reference_normal,
+                "numz": 100.0 * video1_normal / reference_normal,
+                "native": 100.0 * video2_normal / reference_normal,
             },
             False,
         )
@@ -1578,10 +1579,7 @@ class SeedVR2EquivalenceAnalysis:
         if enable_niqe:     enabled_nr.add("niqe")
         if enable_musiq:    enabled_nr.add("musiq")
         if enable_clip_iqa: enabled_nr.add("clip_iqa")
-        if enable_dover:    enabled_nr.add("dover_fused")
         run_rev3_dover = floor_video is not None and reference is not None and enable_dover
-        if run_rev3_dover:
-            enabled_nr.discard("dover_fused")
         if floor_video is not None and reference is None:
             raise ValueError("floor_video requires reference for Rev3 DOVER analysis")
 
@@ -1710,7 +1708,7 @@ class SeedVR2EquivalenceAnalysis:
             "tool_provenance": backend.tool_provenance,
         }
 
-        metrics_json = json.dumps(metrics_doc, indent=2, sort_keys=True)
+        metrics_json = json.dumps(metrics_doc, indent=2)
         artifact_path.write_text(metrics_json, encoding="utf-8")
         try:
             print(_render_equivalence_text_table(metrics_doc), flush=True)
@@ -1724,9 +1722,9 @@ class SeedVR2EquivalenceAnalysis:
                 ref_dover = self._score_dover_input(reference, ref_frames, "cuda")
                 print("[SeedVR2EquivalenceAnalysis] Rev3 DOVER scoring floor", flush=True)
                 floor_dover = self._score_dover_input(floor_video, floor_frames, "cuda")
-                print("[SeedVR2EquivalenceAnalysis] Rev3 DOVER scoring video1", flush=True)
+                print("[SeedVR2EquivalenceAnalysis] Rev3 DOVER scoring numz", flush=True)
                 video1_dover = self._score_dover_input(video1, v1_frames, "cuda")
-                print("[SeedVR2EquivalenceAnalysis] Rev3 DOVER scoring video2", flush=True)
+                print("[SeedVR2EquivalenceAnalysis] Rev3 DOVER scoring native", flush=True)
                 video2_dover = self._score_dover_input(video2, v2_frames, "cuda")
             finally:
                 os.chdir(prev_cwd)
@@ -1740,21 +1738,21 @@ class SeedVR2EquivalenceAnalysis:
                 "formula": "raw_percent_score = 100 * abs(candidate - floor) / abs(reference - floor)",
                 "videos": {
                     "reference": ref_meta,
+                    "numz": v1_meta,
+                    "native": v2_meta,
                     "floor": floor_meta,
-                    "video1": v1_meta,
-                    "video2": v2_meta,
                 },
                 "scores": {
                     "reference": ref_dover,
+                    "numz": video1_dover,
+                    "native": video2_dover,
                     "floor": floor_dover,
-                    "video1": video1_dover,
-                    "video2": video2_dover,
                 },
                 "normalized_delta_from_floor": normalized,
                 "raw_percent_score": raw_percent,
                 "denominator_unstable": denom_unstable,
             }
-            metrics_json = json.dumps(metrics_doc, indent=2, sort_keys=True)
+            metrics_json = json.dumps(metrics_doc, indent=2)
             artifact_path.write_text(metrics_json, encoding="utf-8")
             print(_render_rev3_dover_text_table(metrics_doc), flush=True)
         # Combined verdict surfaced as the third return for downstream nodes:
