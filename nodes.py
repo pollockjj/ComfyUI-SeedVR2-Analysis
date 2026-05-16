@@ -1173,6 +1173,14 @@ def _render_rev3_dover_text_table(metrics_doc: dict) -> str:
         except (TypeError, ValueError):
             return f"{'--':>{width}}"
 
+    def _fmt_percent(value, width=14, precision=2):
+        if value is None:
+            return f"{'--':>{width}}"
+        try:
+            return f"{float(value):>{width - 1}.{precision}f}%"
+        except (TypeError, ValueError):
+            return f"{'--':>{width}}"
+
     lines = []
     lines.append("=" * 96)
     lines.append("SeedVR2 Rev3 DOVER Analysis  -  reference / floor / video1 / video2")
@@ -1184,14 +1192,14 @@ def _render_rev3_dover_text_table(metrics_doc: dict) -> str:
     lines.append("-" * 96)
     lines.append(
         f"{'metric':<14} {'reference':>14} {'floor':>14} "
-        f"{'video1':>14} {'video2':>14} {'video1_raw':>14} {'video2_raw':>14}"
+        f"{'video1':>14} {'video2':>14} {'video1_pct':>14} {'video2_pct':>14}"
     )
     lines.append("-" * 96)
     lines.append(
         f"{'dover_fused':<14} {_fmt(scores.get('reference'))} "
         f"{_fmt(scores.get('floor'))} {_fmt(scores.get('video1'))} "
-        f"{_fmt(scores.get('video2'))} {_fmt(raw.get('video1'))} "
-        f"{_fmt(raw.get('video2'))}"
+        f"{_fmt(scores.get('video2'))} {_fmt_percent(raw.get('video1'))} "
+        f"{_fmt_percent(raw.get('video2'))}"
     )
     lines.append("=" * 96)
     return "\n".join(lines) + "\n"
@@ -1527,8 +1535,8 @@ class SeedVR2EquivalenceAnalysis:
         return (
             normalized,
             {
-                "video1": video1_normal / reference_normal,
-                "video2": video2_normal / reference_normal,
+                "video1": 100.0 * video1_normal / reference_normal,
+                "video2": 100.0 * video2_normal / reference_normal,
             },
             False,
         )
@@ -1729,7 +1737,7 @@ class SeedVR2EquivalenceAnalysis:
                 video2_dover,
             )
             metrics_doc["rev3_dover"] = {
-                "formula": "raw_percent_score = abs(candidate - floor) / abs(reference - floor)",
+                "formula": "raw_percent_score = 100 * abs(candidate - floor) / abs(reference - floor)",
                 "videos": {
                     "reference": ref_meta,
                     "floor": floor_meta,
