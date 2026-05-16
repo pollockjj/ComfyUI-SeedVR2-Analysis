@@ -1195,7 +1195,7 @@ def _render_rev3_text_table(metrics_doc: dict) -> str:
         f"{'native':>14} {'floor':>14} {'numz_pct':>14} {'native_pct':>14}"
     )
     lines.append("-" * 96)
-    for name in ("niqe", "musiq", "clip_iqa", "dover_fused"):
+    for name in ("psnr", "ssim", "lpips", "dists", "niqe", "musiq", "clip_iqa", "dover_fused"):
         metric_scores = scores.get(name)
         if not metric_scores:
             continue
@@ -1527,6 +1527,19 @@ class SeedVR2EquivalenceAnalysis:
         native_score: float,
         floor_score: float,
     ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        import math
+
+        if not all(math.isfinite(v) for v in (ref_score, numz_score, native_score, floor_score)):
+            return (
+                {
+                    "reference": None,
+                    "numz": None,
+                    "native": None,
+                    "floor": None,
+                },
+                {"numz": None, "native": None},
+                True,
+            )
         reference_normal = abs(ref_score - floor_score)
         numz_normal = abs(numz_score - floor_score)
         native_normal = abs(native_score - floor_score)
@@ -1558,6 +1571,23 @@ class SeedVR2EquivalenceAnalysis:
             metric_name,
             [],
         )
+        if not values:
+            raise ValueError(f"Rev3 metric produced no values: {metric_name}")
+        return float(sum(values) / len(values))
+
+    def _rev3_pyiqa_fr_score(
+        self,
+        backend,
+        frames_nhwc,
+        reference_frames_nhwc,
+        metric_name: str,
+    ) -> float:
+        values = self._per_frame_fr(
+            backend,
+            frames_nhwc,
+            reference_frames_nhwc,
+            {metric_name},
+        ).get(metric_name, [])
         if not values:
             raise ValueError(f"Rev3 metric produced no values: {metric_name}")
         return float(sum(values) / len(values))
@@ -1599,12 +1629,18 @@ class SeedVR2EquivalenceAnalysis:
         if enable_niqe:     enabled_nr.add("niqe")
         if enable_musiq:    enabled_nr.add("musiq")
         if enable_clip_iqa: enabled_nr.add("clip_iqa")
+        rev3_enabled_fr: list[str] = []
+        if enable_psnr:  rev3_enabled_fr.append("psnr")
+        if enable_ssim:  rev3_enabled_fr.append("ssim")
+        if enable_lpips: rev3_enabled_fr.append("lpips")
+        if enable_dists: rev3_enabled_fr.append("dists")
         rev3_enabled_nr: list[str] = []
         if enable_niqe:     rev3_enabled_nr.append("niqe")
         if enable_musiq:    rev3_enabled_nr.append("musiq")
         if enable_clip_iqa: rev3_enabled_nr.append("clip_iqa")
         if enable_dover:    rev3_enabled_nr.append("dover_fused")
-        run_rev3 = floor_video is not None and reference is not None and bool(rev3_enabled_nr)
+        rev3_enabled_metrics = rev3_enabled_fr + rev3_enabled_nr
+        run_rev3 = floor_video is not None and reference is not None and bool(rev3_enabled_metrics)
         if floor_video is not None and reference is None:
             raise ValueError("floor_video requires reference for Rev3 analysis")
 
@@ -1745,7 +1781,7 @@ class SeedVR2EquivalenceAnalysis:
             rev3_normalized: dict[str, Any] = {}
             rev3_raw_percent: dict[str, Any] = {}
             rev3_denominator_unstable: dict[str, bool] = {}
-            for metric_name in rev3_enabled_nr:
+            for metric_name in rev3_enabled_metrics:
                 if metric_name == "dover_fused":
                     try:
                         os.chdir(str(DOVER_ROOT))
@@ -1759,6 +1795,15 @@ class SeedVR2EquivalenceAnalysis:
                         floor_score = self._score_dover_input(floor_video, floor_frames, "cuda")
                     finally:
                         os.chdir(prev_cwd)
+                elif metric_name in {"psnr", "ssim", "lpips", "dists"}:
+                    print(f"[SeedVR2EquivalenceAnalysis] Rev3 {metric_name} scoring reference", flush=True)
+                    ref_score = self._rev3_pyiqa_fr_score(backend, ref_frames, ref_frames, metric_name)
+                    print(f"[SeedVR2EquivalenceAnalysis] Rev3 {metric_name} scoring numz", flush=True)
+                    numz_score = self._rev3_pyiqa_fr_score(backend, v1_frames, ref_frames, metric_name)
+                    print(f"[SeedVR2EquivalenceAnalysis] Rev3 {metric_name} scoring native", flush=True)
+                    native_score = self._rev3_pyiqa_fr_score(backend, v2_frames, ref_frames, metric_name)
+                    print(f"[SeedVR2EquivalenceAnalysis] Rev3 {metric_name} scoring floor", flush=True)
+                    floor_score = self._rev3_pyiqa_fr_score(backend, floor_frames, ref_frames, metric_name)
                 else:
                     print(f"[SeedVR2EquivalenceAnalysis] Rev3 {metric_name} scoring reference", flush=True)
                     ref_score = self._rev3_pyiqa_nr_score(backend, ref_frames, ref_fps, metric_name)
