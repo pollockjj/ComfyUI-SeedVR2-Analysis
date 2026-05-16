@@ -1155,7 +1155,7 @@ def _render_rev3_text_table(metrics_doc: dict) -> str:
     block = metrics_doc.get("rev3", {}) or {}
     videos = block.get("videos", {}) or {}
     scores = block.get("scores", {}) or {}
-    raw = block.get("raw_percent_score", {}) or {}
+    perf = block.get("perf_delta", {}) or {}
 
     def _video_label(side: str) -> str:
         v = videos.get(side, {}) or {}
@@ -1173,13 +1173,17 @@ def _render_rev3_text_table(metrics_doc: dict) -> str:
         except (TypeError, ValueError):
             return f"{'--':>{width}}"
 
-    def _fmt_percent(value, width=14, precision=2):
+    def _fmt_percent(value, width=16, precision=1):
         if value is None:
             return f"{'--':>{width}}"
         try:
-            return f"{float(value):>{width - 1}.{precision}f}%"
+            return f"{float(value) * 100.0:>{width - 1}.{precision}f}%"
         except (TypeError, ValueError):
             return f"{'--':>{width}}"
+
+    def _metric_label(name: str) -> str:
+        direction = "higher" if METRIC_HIGHER_IS_BETTER[name] else "lower"
+        return f"{name} ({direction})"
 
     lines = []
     lines.append("=" * 96)
@@ -1191,20 +1195,20 @@ def _render_rev3_text_table(metrics_doc: dict) -> str:
     lines.append(f"floor (ESRGAN):       {_video_label('floor')}")
     lines.append("-" * 96)
     lines.append(
-        f"{'metric':<14} {'reference':>14} {'numz':>14} "
-        f"{'native':>14} {'floor':>14} {'numz_pct':>14} {'native_pct':>14}"
+        f"{'metric':<20} {'reference':>14} {'numz':>14} "
+        f"{'native':>14} {'floor':>14} {'perf_delta_numz':>16} {'perf_delta_native':>18}"
     )
     lines.append("-" * 96)
     for name in ("psnr", "ssim", "lpips", "dists", "niqe", "musiq", "clip_iqa", "dover_fused"):
         metric_scores = scores.get(name)
         if not metric_scores:
             continue
-        metric_raw = raw.get(name, {}) or {}
+        metric_perf = perf.get(name, {}) or {}
         lines.append(
-            f"{name:<14} {_fmt(metric_scores.get('reference'))} "
+            f"{_metric_label(name):<20} {_fmt(metric_scores.get('reference'))} "
             f"{_fmt(metric_scores.get('numz'))} {_fmt(metric_scores.get('native'))} "
-            f"{_fmt(metric_scores.get('floor'))} {_fmt_percent(metric_raw.get('numz'))} "
-            f"{_fmt_percent(metric_raw.get('native'))}"
+            f"{_fmt(metric_scores.get('floor'))} "
+            f"{_fmt_percent(metric_perf.get('numz'))} {_fmt_percent(metric_perf.get('native'), 18)}"
         )
     lines.append("=" * 96)
     return "\n".join(lines) + "\n"
@@ -1560,6 +1564,36 @@ class SeedVR2EquivalenceAnalysis:
             False,
         )
 
+    @staticmethod
+    def _rev3_perf_delta(
+        metric_name: str,
+        ref_score: float,
+        numz_score: float,
+        native_score: float,
+        floor_score: float,
+    ) -> tuple[dict[str, Any], bool]:
+        import math
+
+        if not all(math.isfinite(v) for v in (ref_score, numz_score, native_score, floor_score)):
+            return {"numz": None, "native": None}, True
+        if metric_name in {"psnr", "ssim"}:
+            return {
+                "numz": numz_score - floor_score,
+                "native": native_score - floor_score,
+            }, False
+        if metric_name in {"lpips", "dists"}:
+            return {
+                "numz": floor_score - numz_score,
+                "native": floor_score - native_score,
+            }, False
+        denom = ref_score - floor_score
+        if abs(denom) < 1e-9:
+            return {"numz": None, "native": None}, True
+        return {
+            "numz": (numz_score - floor_score) / denom,
+            "native": (native_score - floor_score) / denom,
+        }, False
+
     def _rev3_pyiqa_nr_score(
         self,
         backend,
@@ -1769,17 +1803,12 @@ class SeedVR2EquivalenceAnalysis:
             "tool_provenance": backend.tool_provenance,
         }
 
-        metrics_json = json.dumps(metrics_doc, indent=2)
-        artifact_path.write_text(metrics_json, encoding="utf-8")
-        try:
-            print(_render_equivalence_text_table(metrics_doc), flush=True)
-        except Exception:
-            pass
         if run_rev3:
             prev_cwd = os.getcwd()
             rev3_scores: dict[str, Any] = {}
             rev3_normalized: dict[str, Any] = {}
             rev3_raw_percent: dict[str, Any] = {}
+            rev3_perf_delta: dict[str, Any] = {}
             rev3_denominator_unstable: dict[str, bool] = {}
             for metric_name in rev3_enabled_metrics:
                 if metric_name == "dover_fused":
@@ -1819,6 +1848,13 @@ class SeedVR2EquivalenceAnalysis:
                     native_score,
                     floor_score,
                 )
+                perf_delta, perf_delta_unstable = self._rev3_perf_delta(
+                    metric_name,
+                    ref_score,
+                    numz_score,
+                    native_score,
+                    floor_score,
+                )
                 rev3_scores[metric_name] = {
                     "reference": ref_score,
                     "numz": numz_score,
@@ -1827,9 +1863,20 @@ class SeedVR2EquivalenceAnalysis:
                 }
                 rev3_normalized[metric_name] = normalized
                 rev3_raw_percent[metric_name] = raw_percent
-                rev3_denominator_unstable[metric_name] = denom_unstable
+                rev3_perf_delta[metric_name] = perf_delta
+                rev3_denominator_unstable[metric_name] = denom_unstable or perf_delta_unstable
             metrics_doc["rev3"] = {
                 "formula": "raw_percent_score = 100 * abs(candidate - floor) / abs(reference - floor)",
+                "perf_delta_formula": {
+                    "psnr": "actual - floor",
+                    "ssim": "actual - floor",
+                    "lpips": "floor - actual",
+                    "dists": "floor - actual",
+                    "niqe": "(actual - floor) / (reference - floor)",
+                    "musiq": "(actual - floor) / (reference - floor)",
+                    "clip_iqa": "(actual - floor) / (reference - floor)",
+                    "dover_fused": "(actual - floor) / (reference - floor)",
+                },
                 "videos": {
                     "reference": ref_meta,
                     "numz": v1_meta,
@@ -1839,11 +1886,15 @@ class SeedVR2EquivalenceAnalysis:
                 "scores": rev3_scores,
                 "normalized_delta_from_floor": rev3_normalized,
                 "raw_percent_score": rev3_raw_percent,
+                "perf_delta": rev3_perf_delta,
                 "denominator_unstable": rev3_denominator_unstable,
             }
             metrics_json = json.dumps(metrics_doc, indent=2)
             artifact_path.write_text(metrics_json, encoding="utf-8")
             print(_render_rev3_text_table(metrics_doc), flush=True)
+        else:
+            metrics_json = json.dumps(metrics_doc, indent=2)
+            artifact_path.write_text(metrics_json, encoding="utf-8")
         # Combined verdict surfaced as the third return for downstream nodes:
         # "{equivalence_overall}|{aggregate_non_inferiority}"
         combined = f"{overall}|{joint_ni.get('aggregate_verdict', 'UNDECIDED')}"
