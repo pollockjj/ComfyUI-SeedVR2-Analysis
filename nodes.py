@@ -183,18 +183,46 @@ def _is_video_object(obj: Any) -> bool:
     return callable(getattr(obj, "get_components", None))
 
 
-def _frames_from_webp(path: Path) -> tuple[Any, Fraction]:
+def _frames_from_webp(source: Any) -> tuple[Any, Fraction]:
     import numpy as np
     import torch
     from PIL import Image, ImageSequence
 
-    im = Image.open(path)
+    if callable(getattr(source, "seek", None)):
+        source.seek(0)
+    im = Image.open(source)
     frames_np = [np.asarray(frame.convert("RGB")) for frame in ImageSequence.Iterator(im)]
     if not frames_np:
-        raise ValueError(f"WebP has zero frames: {path}")
+        raise ValueError(f"WebP has zero frames: {source}")
     images_u8 = np.stack(frames_np, axis=0)
     images = torch.from_numpy(images_u8).to(dtype=torch.float32).div_(255.0).contiguous()
     return images, WEBP_DEFAULT_FRAME_RATE
+
+
+def _webp_source_from_video_object(video_obj: Any) -> Any | None:
+    getter = getattr(video_obj, "get_stream_source", None)
+    if callable(getter):
+        source = getter()
+        if isinstance(source, (str, Path)):
+            path = Path(source)
+            if path.suffix.lower() == ".webp" and path.is_file():
+                return path
+        if callable(getattr(source, "seek", None)):
+            name = getattr(source, "name", "")
+            if str(name).lower().endswith(".webp"):
+                return source
+
+    for attr in ("_VideoFromFile__file", "file", "path", "_path"):
+        source = getattr(video_obj, attr, None)
+        if isinstance(source, (str, Path)):
+            path = Path(source)
+            if path.suffix.lower() == ".webp" and path.is_file():
+                return path
+        if callable(getattr(source, "seek", None)):
+            name = getattr(source, "name", "")
+            if str(name).lower().endswith(".webp"):
+                return source
+    return None
 
 
 def _frames_from_video(video_obj_or_path: Any) -> tuple[Any, Fraction]:
@@ -205,6 +233,9 @@ def _frames_from_video(video_obj_or_path: Any) -> tuple[Any, Fraction]:
     import torch  # noqa: F401  (cheap; deferred to keep ComfyUI startup fast)
 
     if _is_video_object(video_obj_or_path):
+        webp_source = _webp_source_from_video_object(video_obj_or_path)
+        if webp_source is not None:
+            return _frames_from_webp(webp_source)
         components = video_obj_or_path.get_components()
         images = components.images  # (N, H, W, C) float in [0, 1]
         frame_rate = components.frame_rate
