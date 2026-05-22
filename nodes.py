@@ -53,7 +53,17 @@ REPO_ROOT = Path(__file__).resolve().parent
 DOVER_ROOT = REPO_ROOT / "vendor" / "DOVER"
 
 NR_METRIC_NAMES = ("niqe", "musiq", "clip_iqa", "dover_fused")
-FR_METRIC_NAMES = ("psnr", "ssim", "lpips", "dists")
+COLOR_METRIC_NAMES = (
+    "deltae76",
+    "deltae00",
+    "lab_l_mae",
+    "lab_a_mae",
+    "lab_b_mae",
+    "chroma_mae",
+    "hue_mae_deg",
+    "lab_hist_w1",
+)
+FR_METRIC_NAMES = ("psnr", "ssim", "lpips", "dists") + COLOR_METRIC_NAMES
 VIDEO_ALIGNMENT_KEYS = ("frame_count", "frame_rate", "width", "height")
 DOVER_SAMPLE_SEED = 5770521
 WEBP_DEFAULT_FRAME_RATE = Fraction(25, 1)
@@ -455,6 +465,72 @@ class SeedVR2MetricBackend:
                 tmp_video.unlink(missing_ok=True)
         return results
 
+    @staticmethod
+    def _lab_histogram_w1(lab_a, lab_b) -> float:
+        import numpy as np
+
+        ranges = ((0.0, 100.0), (-128.0, 127.0), (-128.0, 127.0))
+        distances = []
+        for channel, value_range in enumerate(ranges):
+            hist_a, edges = np.histogram(
+                lab_a[..., channel],
+                bins=256,
+                range=value_range,
+                density=False,
+            )
+            hist_b, _ = np.histogram(
+                lab_b[..., channel],
+                bins=256,
+                range=value_range,
+                density=False,
+            )
+            hist_a = hist_a.astype(np.float64)
+            hist_b = hist_b.astype(np.float64)
+            hist_a /= hist_a.sum()
+            hist_b /= hist_b.sum()
+            bin_width = float(edges[1] - edges[0])
+            distances.append(float(np.abs(np.cumsum(hist_a) - np.cumsum(hist_b)).sum() * bin_width))
+        return float(np.mean(distances))
+
+    @staticmethod
+    def _run_color_per_frame(out_frames_nhwc, ref_frames_nhwc, enabled: set[str]) -> dict[str, list[float]]:
+        import numpy as np
+        from skimage.color import deltaE_ciede2000, rgb2lab
+
+        out: dict[str, list[float]] = {name: [] for name in sorted(enabled & set(COLOR_METRIC_NAMES))}
+        if not out:
+            return out
+        n = out_frames_nhwc.shape[0]
+        out_np = out_frames_nhwc.detach().cpu().clamp(0.0, 1.0).numpy()
+        ref_np = ref_frames_nhwc.detach().cpu().clamp(0.0, 1.0).numpy()
+        for i in range(n):
+            lab_a = rgb2lab(out_np[i])
+            lab_b = rgb2lab(ref_np[i])
+            diff = lab_a - lab_b
+            if "deltae76" in out:
+                out["deltae76"].append(float(np.linalg.norm(diff, axis=-1).mean()))
+            if "deltae00" in out:
+                out["deltae00"].append(float(deltaE_ciede2000(lab_a, lab_b).mean()))
+            if "lab_l_mae" in out:
+                out["lab_l_mae"].append(float(np.abs(diff[..., 0]).mean()))
+            if "lab_a_mae" in out:
+                out["lab_a_mae"].append(float(np.abs(diff[..., 1]).mean()))
+            if "lab_b_mae" in out:
+                out["lab_b_mae"].append(float(np.abs(diff[..., 2]).mean()))
+            chroma_a = np.hypot(lab_a[..., 1], lab_a[..., 2])
+            chroma_b = np.hypot(lab_b[..., 1], lab_b[..., 2])
+            if "chroma_mae" in out:
+                out["chroma_mae"].append(float(np.abs(chroma_a - chroma_b).mean()))
+            if "hue_mae_deg" in out:
+                hue_a = np.degrees(np.arctan2(lab_a[..., 2], lab_a[..., 1])) % 360.0
+                hue_b = np.degrees(np.arctan2(lab_b[..., 2], lab_b[..., 1])) % 360.0
+                hue_diff = np.abs(((hue_a - hue_b + 180.0) % 360.0) - 180.0)
+                chroma_mask = (chroma_a > 1e-6) | (chroma_b > 1e-6)
+                out["hue_mae_deg"].append(float(hue_diff[chroma_mask].mean()) if chroma_mask.any() else 0.0)
+            if "lab_hist_w1" in out:
+                out["lab_hist_w1"].append(SeedVR2MetricBackend._lab_histogram_w1(lab_a, lab_b))
+        return out
+
     def compute_fr_metrics(
         self,
         out_frames_nhwc,
@@ -493,6 +569,12 @@ class SeedVR2MetricBackend:
             results["dists"] = _aggregate(
                 self._run_pyiqa_per_frame("dists", out_chw, ref_chw)
             )
+        for name, values in self._run_color_per_frame(
+            out_frames_nhwc,
+            ref_frames_nhwc,
+            enabled,
+        ).items():
+            results[name] = _aggregate(values)
         return results
 
     @property
@@ -544,6 +626,10 @@ class SeedVR2MetricBackend:
                 "version": torch.__version__,
                 "cuda": torch.version.cuda or "",
             },
+            "skimage": {
+                "name": "scikit-image",
+                "version": _pkg_version("scikit-image"),
+            },
             "ffmpeg": {
                 "name": "ffmpeg",
                 "version": ffmpeg_first_line,
@@ -579,6 +665,7 @@ class SeedVR2Analysis:
                 "enable_ssim": ("BOOLEAN", {"default": True}),
                 "enable_lpips": ("BOOLEAN", {"default": True}),
                 "enable_dists": ("BOOLEAN", {"default": True}),
+                "enable_color_metrics": ("BOOLEAN", {"default": False}),
                 # NR metric toggles
                 "enable_niqe": ("BOOLEAN", {"default": True}),
                 "enable_musiq": ("BOOLEAN", {"default": True}),
@@ -717,6 +804,7 @@ class SeedVR2Analysis:
         enable_ssim: bool = True,
         enable_lpips: bool = True,
         enable_dists: bool = True,
+        enable_color_metrics: bool = False,
         enable_niqe: bool = True,
         enable_musiq: bool = True,
         enable_clip_iqa: bool = True,
@@ -731,6 +819,7 @@ class SeedVR2Analysis:
         if enable_ssim:  enabled_fr.add("ssim")
         if enable_lpips: enabled_fr.add("lpips")
         if enable_dists: enabled_fr.add("dists")
+        if enable_color_metrics: enabled_fr.update(COLOR_METRIC_NAMES)
         enabled_nr: set[str] = set()
         if enable_niqe:     enabled_nr.add("niqe")
         if enable_musiq:    enabled_nr.add("musiq")
@@ -842,7 +931,7 @@ class SeedVR2Analysis:
         return (metrics_json, str(artifact_path))
 
 
-EQUIVALENCE_SCHEMA_VERSION = "2.1"
+EQUIVALENCE_SCHEMA_VERSION = "2.2"
 
 # Direction: True iff higher metric value = better quality.
 # video1 is treated as the "candidate" (e.g. native); video2 is the "reference impl" (e.g. numz).
@@ -855,6 +944,14 @@ METRIC_HIGHER_IS_BETTER = {
     "dover_fused": True,
     "lpips": False,
     "dists": False,
+    "deltae76": False,
+    "deltae00": False,
+    "lab_l_mae": False,
+    "lab_a_mae": False,
+    "lab_b_mae": False,
+    "chroma_mae": False,
+    "hue_mae_deg": False,
+    "lab_hist_w1": False,
     "niqe": False,
 }
 
@@ -1129,6 +1226,14 @@ def _render_equivalence_text_table(metrics_doc: dict) -> str:
         ("ssim", "fr", "higher_is_better"),
         ("lpips", "fr", "lower_is_better"),
         ("dists", "fr", "lower_is_better"),
+        ("deltae76", "fr", "lower_is_better"),
+        ("deltae00", "fr", "lower_is_better"),
+        ("lab_l_mae", "fr", "lower_is_better"),
+        ("lab_a_mae", "fr", "lower_is_better"),
+        ("lab_b_mae", "fr", "lower_is_better"),
+        ("chroma_mae", "fr", "lower_is_better"),
+        ("hue_mae_deg", "fr", "lower_is_better"),
+        ("lab_hist_w1", "fr", "lower_is_better"),
         ("niqe", "nr", "lower_is_better"),
         ("musiq", "nr", "higher_is_better"),
         ("clip_iqa", "nr", "higher_is_better"),
@@ -1230,12 +1335,12 @@ def _render_rev3_text_table(metrics_doc: dict) -> str:
         f"{'native':>14} {'floor':>14} {'perf_delta_numz':>16} {'perf_delta_native':>18}"
     )
     lines.append("-" * 96)
-    for name in ("psnr", "ssim", "lpips", "dists", "niqe", "musiq", "clip_iqa", "dover_fused"):
+    for name in ("psnr", "ssim", "lpips", "dists", *COLOR_METRIC_NAMES, "niqe", "musiq", "clip_iqa", "dover_fused"):
         metric_scores = scores.get(name)
         if not metric_scores:
             continue
         metric_perf = perf.get(name, {}) or {}
-        reference_score = None if name in {"psnr", "ssim", "lpips", "dists"} else metric_scores.get("reference")
+        reference_score = None if name in set(FR_METRIC_NAMES) else metric_scores.get("reference")
         lines.append(
             f"{_metric_label(name):<20} {_fmt(reference_score)} "
             f"{_fmt(metric_scores.get('numz'))} {_fmt(metric_scores.get('native'))} "
@@ -1279,6 +1384,7 @@ class SeedVR2EquivalenceAnalysis:
                 "enable_ssim": ("BOOLEAN", {"default": True}),
                 "enable_lpips": ("BOOLEAN", {"default": True}),
                 "enable_dists": ("BOOLEAN", {"default": True}),
+                "enable_color_metrics": ("BOOLEAN", {"default": False}),
                 "enable_niqe": ("BOOLEAN", {"default": True}),
                 "enable_musiq": ("BOOLEAN", {"default": True}),
                 "enable_clip_iqa": ("BOOLEAN", {"default": True}),
@@ -1288,6 +1394,7 @@ class SeedVR2EquivalenceAnalysis:
                 "rope_ssim": ("FLOAT", {"default": 0.005, "min": 0.0, "step": 0.001}),
                 "rope_lpips": ("FLOAT", {"default": 0.005, "min": 0.0, "step": 0.001}),
                 "rope_dists": ("FLOAT", {"default": 0.005, "min": 0.0, "step": 0.001}),
+                "rope_color": ("FLOAT", {"default": 0.10, "min": 0.0, "step": 0.01}),
                 "rope_niqe": ("FLOAT", {"default": 0.10, "min": 0.0, "step": 0.01}),
                 "rope_musiq": ("FLOAT", {"default": 1.00, "min": 0.0, "step": 0.1}),
                 "rope_clip_iqa": ("FLOAT", {"default": 0.02, "min": 0.0, "step": 0.001}),
@@ -1386,6 +1493,12 @@ class SeedVR2EquivalenceAnalysis:
             )))
         if "dists" in enabled_fr:
             out["dists"] = list(map(float, backend._run_pyiqa_per_frame("dists", out_chw, ref_chw)))
+        for name, values in backend._run_color_per_frame(
+            out_frames_nhwc,
+            ref_frames_nhwc,
+            enabled_fr,
+        ).items():
+            out[name] = list(map(float, values))
         return out
 
     @staticmethod
@@ -1613,7 +1726,7 @@ class SeedVR2EquivalenceAnalysis:
                 "numz": numz_score - floor_score,
                 "native": native_score - floor_score,
             }, False
-        if metric_name in {"lpips", "dists"}:
+        if metric_name in {"lpips", "dists", *COLOR_METRIC_NAMES}:
             return {
                 "numz": floor_score - numz_score,
                 "native": floor_score - native_score,
@@ -1669,6 +1782,7 @@ class SeedVR2EquivalenceAnalysis:
         enable_ssim: bool = True,
         enable_lpips: bool = True,
         enable_dists: bool = True,
+        enable_color_metrics: bool = False,
         enable_niqe: bool = True,
         enable_musiq: bool = True,
         enable_clip_iqa: bool = True,
@@ -1677,6 +1791,7 @@ class SeedVR2EquivalenceAnalysis:
         rope_ssim: float = 0.005,
         rope_lpips: float = 0.005,
         rope_dists: float = 0.005,
+        rope_color: float = 0.10,
         rope_niqe: float = 0.10,
         rope_musiq: float = 1.00,
         rope_clip_iqa: float = 0.02,
@@ -1691,6 +1806,7 @@ class SeedVR2EquivalenceAnalysis:
         if enable_ssim:  enabled_fr.add("ssim")
         if enable_lpips: enabled_fr.add("lpips")
         if enable_dists: enabled_fr.add("dists")
+        if enable_color_metrics: enabled_fr.update(COLOR_METRIC_NAMES)
         enabled_nr: set[str] = set()
         if enable_niqe:     enabled_nr.add("niqe")
         if enable_musiq:    enabled_nr.add("musiq")
@@ -1700,6 +1816,7 @@ class SeedVR2EquivalenceAnalysis:
         if enable_ssim:  rev3_enabled_fr.append("ssim")
         if enable_lpips: rev3_enabled_fr.append("lpips")
         if enable_dists: rev3_enabled_fr.append("dists")
+        if enable_color_metrics: rev3_enabled_fr.extend(COLOR_METRIC_NAMES)
         rev3_enabled_nr: list[str] = []
         if enable_niqe:     rev3_enabled_nr.append("niqe")
         if enable_musiq:    rev3_enabled_nr.append("musiq")
@@ -1714,6 +1831,7 @@ class SeedVR2EquivalenceAnalysis:
             "psnr": rope_psnr, "ssim": rope_ssim, "lpips": rope_lpips, "dists": rope_dists,
             "niqe": rope_niqe, "musiq": rope_musiq, "clip_iqa": rope_clip_iqa, "dover_fused": rope_dover,
         }
+        ropes.update({name: rope_color for name in COLOR_METRIC_NAMES})
 
         # Output destination
         if output_directory.strip():
@@ -1856,7 +1974,7 @@ class SeedVR2EquivalenceAnalysis:
                         floor_score = self._score_dover_input(floor_video, floor_frames, "cuda")
                     finally:
                         os.chdir(prev_cwd)
-                elif metric_name in {"psnr", "ssim", "lpips", "dists"}:
+                elif metric_name in set(FR_METRIC_NAMES):
                     print(f"[SeedVR2EquivalenceAnalysis] Rev3 {metric_name} scoring reference", flush=True)
                     ref_score = self._rev3_pyiqa_fr_score(backend, ref_frames, ref_frames, metric_name)
                     print(f"[SeedVR2EquivalenceAnalysis] Rev3 {metric_name} scoring numz", flush=True)
@@ -1904,6 +2022,14 @@ class SeedVR2EquivalenceAnalysis:
                     "ssim": "actual - floor",
                     "lpips": "floor - actual",
                     "dists": "floor - actual",
+                    "deltae76": "floor - actual",
+                    "deltae00": "floor - actual",
+                    "lab_l_mae": "floor - actual",
+                    "lab_a_mae": "floor - actual",
+                    "lab_b_mae": "floor - actual",
+                    "chroma_mae": "floor - actual",
+                    "hue_mae_deg": "floor - actual",
+                    "lab_hist_w1": "floor - actual",
                     "niqe": "(actual - floor) / (reference - floor)",
                     "musiq": "(actual - floor) / (reference - floor)",
                     "clip_iqa": "(actual - floor) / (reference - floor)",
