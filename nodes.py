@@ -932,6 +932,8 @@ class SeedVR2Analysis:
 
 
 EQUIVALENCE_SCHEMA_VERSION = "2.2"
+WORST_FRAME_SCHEMA_VERSION = "1.0"
+FAST_VISUAL_FIDELITY_METRICS = ("psnr", "ssim", "lpips", "dists")
 
 # Direction: True iff higher metric value = better quality.
 # video1 is treated as the "candidate" (e.g. native); video2 is the "reference impl" (e.g. numz).
@@ -2059,11 +2061,181 @@ class SeedVR2EquivalenceAnalysis:
         return (metrics_json, str(artifact_path), combined)
 
 
+class SeedVR2WorstFrameFidelityAnalysis:
+    """Fast full-reference visual-fidelity check for chunk-boundary regressions."""
+
+    def __init__(self, metric_backend=None):
+        self._metric_backend = metric_backend
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "reference": ("VIDEO",),
+                "full_chunk": ("VIDEO",),
+                "two_chunk": ("VIDEO",),
+            },
+            "optional": {
+                "lpips_backbone": (["alex", "vgg"], {"default": "alex"}),
+                "output_directory": ("STRING", {"default": ""}),
+                "output_filename": ("STRING", {"default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("metrics_json", "artifact_path", "worst_summary")
+    FUNCTION = "analyze"
+    CATEGORY = "video/analysis"
+    OUTPUT_NODE = True
+
+    @staticmethod
+    def _artifact_dir() -> Path:
+        try:
+            import folder_paths
+            return Path(folder_paths.get_output_directory()) / "seedvr2_analysis"
+        except Exception:
+            return REPO_ROOT / "outputs" / "seedvr2_analysis"
+
+    @staticmethod
+    def _input_label(value) -> str:
+        return repr(type(value).__name__) if _is_video_object(value) else str(value)
+
+    @staticmethod
+    def _per_frame_fr(backend, frames_nhwc, reference_frames_nhwc) -> dict[str, list[float]]:
+        if frames_nhwc.shape != reference_frames_nhwc.shape:
+            raise ValueError(
+                f"FR pair tensor shape mismatch: output={tuple(frames_nhwc.shape)} "
+                f"reference={tuple(reference_frames_nhwc.shape)}"
+            )
+        out_chw = _to_pyiqa_input(frames_nhwc)
+        ref_chw = _to_pyiqa_input(reference_frames_nhwc)
+        return {
+            "psnr": list(map(float, backend._run_pyiqa_per_frame("psnr", out_chw, ref_chw))),
+            "ssim": list(map(float, backend._run_pyiqa_per_frame("ssim", out_chw, ref_chw))),
+            "lpips": list(map(float, backend._run_pyiqa_per_frame(
+                "lpips", out_chw, ref_chw, net=backend._lpips_backbone
+            ))),
+            "dists": list(map(float, backend._run_pyiqa_per_frame("dists", out_chw, ref_chw))),
+        }
+
+    @staticmethod
+    def _worse_label(full_value: float, two_value: float, higher_is_better: bool) -> str:
+        if full_value == two_value:
+            return "tie"
+        if higher_is_better:
+            return "full_chunk" if full_value < two_value else "two_chunk"
+        return "full_chunk" if full_value > two_value else "two_chunk"
+
+    @staticmethod
+    def _worse_score(full_value: float, two_value: float, higher_is_better: bool) -> float:
+        return min(full_value, two_value) if higher_is_better else max(full_value, two_value)
+
+    @classmethod
+    def _worst_frame(cls, rows: list[dict[str, Any]], higher_is_better: bool) -> dict[str, Any]:
+        if not rows:
+            raise ValueError("metric produced zero frames")
+        key = lambda row: row["worst_score"]
+        return min(rows, key=key) if higher_is_better else max(rows, key=key)
+
+    def analyze(
+        self,
+        reference,
+        full_chunk,
+        two_chunk,
+        lpips_backbone: str = "alex",
+        output_directory: str = "",
+        output_filename: str = "",
+    ):
+        if output_directory.strip():
+            artifact_dir = Path(output_directory).expanduser().resolve()
+        else:
+            artifact_dir = self._artifact_dir()
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        if output_filename.strip():
+            fname = output_filename.strip()
+            if not fname.lower().endswith(".json"):
+                fname = fname + ".json"
+        else:
+            fname = f"seedvr2_worst_frame_fidelity_{uuid.uuid4().hex}.json"
+        artifact_path = artifact_dir / fname
+
+        reference_frames, reference_fps = _frames_from_video(reference)
+        full_frames, full_fps = _frames_from_video(full_chunk)
+        two_frames, two_fps = _frames_from_video(two_chunk)
+
+        reference_meta = SeedVR2EquivalenceAnalysis._alignment_metadata(reference_frames, reference_fps)
+        full_meta = SeedVR2EquivalenceAnalysis._alignment_metadata(full_frames, full_fps)
+        two_meta = SeedVR2EquivalenceAnalysis._alignment_metadata(two_frames, two_fps)
+        SeedVR2EquivalenceAnalysis._assert_alignment_pair(reference_meta, full_meta, "reference", "full_chunk")
+        SeedVR2EquivalenceAnalysis._assert_alignment_pair(reference_meta, two_meta, "reference", "two_chunk")
+
+        backend = self._metric_backend or SeedVR2MetricBackend(lpips_backbone=lpips_backbone)
+        full_metrics = self._per_frame_fr(backend, full_frames, reference_frames)
+        two_metrics = self._per_frame_fr(backend, two_frames, reference_frames)
+
+        metrics: dict[str, Any] = {}
+        summary_lines: list[str] = []
+        for metric_name in FAST_VISUAL_FIDELITY_METRICS:
+            higher_is_better = METRIC_HIGHER_IS_BETTER[metric_name]
+            full_values = full_metrics[metric_name]
+            two_values = two_metrics[metric_name]
+            if len(full_values) != len(two_values):
+                raise ValueError(
+                    f"metric frame count mismatch for {metric_name}: "
+                    f"full_chunk={len(full_values)} two_chunk={len(two_values)}"
+                )
+            rows: list[dict[str, Any]] = []
+            for i, (full_value, two_value) in enumerate(zip(full_values, two_values)):
+                rows.append({
+                    "frame_index": i,
+                    "frame_number": i + 1,
+                    "full_chunk": full_value,
+                    "two_chunk": two_value,
+                    "worst_score": self._worse_score(full_value, two_value, higher_is_better),
+                    "worst_video": self._worse_label(full_value, two_value, higher_is_better),
+                })
+            worst = self._worst_frame(rows, higher_is_better)
+            metrics[metric_name] = {
+                "direction": "higher" if higher_is_better else "lower",
+                "full_chunk": _aggregate(full_values),
+                "two_chunk": _aggregate(two_values),
+                "per_frame_worst": rows,
+                "worst_frame": worst,
+            }
+            summary_lines.append(
+                f"{metric_name}: frame {worst['frame_number']} "
+                f"{worst['worst_video']} score={worst['worst_score']:.6f}"
+            )
+
+        metrics_doc = {
+            "schema_version": WORST_FRAME_SCHEMA_VERSION,
+            "node": "SeedVR2WorstFrameFidelityAnalysis",
+            "inputs": {
+                "reference": self._input_label(reference),
+                "full_chunk": self._input_label(full_chunk),
+                "two_chunk": self._input_label(two_chunk),
+            },
+            "videos": {
+                "reference": reference_meta,
+                "full_chunk": full_meta,
+                "two_chunk": two_meta,
+            },
+            "metrics": metrics,
+            "tool_provenance": backend.tool_provenance,
+        }
+        metrics_json = json.dumps(metrics_doc, indent=2)
+        artifact_path.write_text(metrics_json, encoding="utf-8")
+        worst_summary = " | ".join(summary_lines)
+        return (metrics_json, str(artifact_path), worst_summary)
+
+
 NODE_CLASS_MAPPINGS = {
     "SeedVR2Analysis": SeedVR2Analysis,
     "SeedVR2EquivalenceAnalysis": SeedVR2EquivalenceAnalysis,
+    "SeedVR2WorstFrameFidelityAnalysis": SeedVR2WorstFrameFidelityAnalysis,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2Analysis": "SeedVR2 Analysis",
     "SeedVR2EquivalenceAnalysis": "SeedVR2 Equivalence Analysis (BEST + ROPE)",
+    "SeedVR2WorstFrameFidelityAnalysis": "SeedVR2 Worst-Frame Fidelity Analysis",
 }
