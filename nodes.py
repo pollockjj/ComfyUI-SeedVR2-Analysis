@@ -2137,6 +2137,32 @@ class SeedVR2WorstFrameFidelityAnalysis:
         key = lambda row: row["worst_score"]
         return min(rows, key=key) if higher_is_better else max(rows, key=key)
 
+    @staticmethod
+    def _tool_provenance() -> dict[str, Any]:
+        def _pkg_version(name: str) -> str:
+            try:
+                return importlib_metadata.version(name)
+            except importlib_metadata.PackageNotFoundError:
+                raise RuntimeError(f"required package not installed: {name}")
+
+        import torch
+
+        return {
+            "pyiqa": {
+                "name": "pyiqa",
+                "version": _pkg_version("pyiqa"),
+            },
+            "av": {
+                "name": "av",
+                "version": _pkg_version("av"),
+            },
+            "torch": {
+                "name": "torch",
+                "version": torch.__version__,
+                "cuda": torch.version.cuda or "",
+            },
+        }
+
     def analyze(
         self,
         reference,
@@ -2221,7 +2247,7 @@ class SeedVR2WorstFrameFidelityAnalysis:
                 "two_chunk": two_meta,
             },
             "metrics": metrics,
-            "tool_provenance": backend.tool_provenance,
+            "tool_provenance": self._tool_provenance(),
         }
         metrics_json = json.dumps(metrics_doc, indent=2)
         artifact_path.write_text(metrics_json, encoding="utf-8")
