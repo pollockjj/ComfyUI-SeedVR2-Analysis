@@ -1,6 +1,7 @@
 from .nodes import (
     SeedVR2Analysis,
     SeedVR2EquivalenceAnalysis,
+    SeedVR2NativeLatentToNumzDiT,
     SeedVR2NumzPreparedConditioningToNative,
     SeedVR2NumzUpscaledLatentFileToNative,
     SeedVR2WorstFrameFidelityAnalysis,
@@ -12,6 +13,7 @@ NODE_CLASS_MAPPINGS = {
     "SeedVR2WorstFrameFidelityAnalysis": SeedVR2WorstFrameFidelityAnalysis,
     "SeedVR2NumzPreparedConditioningToNative": SeedVR2NumzPreparedConditioningToNative,
     "SeedVR2NumzUpscaledLatentFileToNative": SeedVR2NumzUpscaledLatentFileToNative,
+    "SeedVR2NativeLatentToNumzDiT": SeedVR2NativeLatentToNumzDiT,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -20,6 +22,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2WorstFrameFidelityAnalysis": "SeedVR2 Worst-Frame Fidelity Analysis",
     "SeedVR2NumzPreparedConditioningToNative": "SeedVR2 Numz Prepared Conditioning -> Native",
     "SeedVR2NumzUpscaledLatentFileToNative": "SeedVR2 Numz Upscaled Latent File -> Native",
+    "SeedVR2NativeLatentToNumzDiT": "SeedVR2 Native Latent -> Numz DiT",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

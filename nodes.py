@@ -2291,6 +2291,25 @@ def _numz_latent_to_native_samples(latent: Any) -> dict[str, Any]:
     return _native_5d_to_collapsed_samples(_numz_latent_to_native_5d(latent))
 
 
+def _native_latent_to_numz_latent(latent: dict[str, Any]) -> Any:
+    samples = latent.get("samples")
+    if samples is None:
+        raise ValueError("native LATENT input is missing samples")
+    if samples.ndim == 4:
+        b, ct, h, w = samples.shape
+        if ct % 16 != 0:
+            raise ValueError(f"native collapsed latent channel count is not divisible by 16: {tuple(samples.shape)}")
+        t = ct // 16
+        samples = samples.reshape(b, 16, t, h, w)
+    elif samples.ndim != 5:
+        raise ValueError(f"expected native latent shape 4D or 5D, got {tuple(samples.shape)}")
+    if samples.shape[1] != 16:
+        raise ValueError(f"expected native channel-first latent with 16 channels, got {tuple(samples.shape)}")
+    if samples.shape[0] != 1:
+        raise ValueError(f"bridge expects batch size 1 for this probe, got {tuple(samples.shape)}")
+    return samples[0].movedim(0, -1).contiguous()
+
+
 class SeedVR2NumzPreparedConditioningToNative:
     @classmethod
     def INPUT_TYPES(cls):
@@ -2404,12 +2423,176 @@ class SeedVR2NumzUpscaledLatentFileToNative:
         return (_numz_latent_to_native_samples(latent),)
 
 
+class SeedVR2NativeLatentToNumzDiT:
+    @classmethod
+    def INPUT_TYPES(cls):
+        _ensure_numz_import_path()
+        from src.optimization.memory_manager import get_device_list
+
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "native_latent": ("LATENT",),
+                "dit": ("SEEDVR2_DIT",),
+                "vae": ("SEEDVR2_VAE",),
+                "seed": ("INT", {"default": 5770521, "min": 0, "max": 2**32 - 1, "step": 1}),
+                "resolution": ("INT", {"default": 1314, "min": 16, "max": 16384, "step": 2}),
+                "max_resolution": ("INT", {"default": 4096, "min": 0, "max": 16384, "step": 2}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 16384, "step": 1}),
+                "color_correction": (["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"], {"default": "lab"}),
+                "latent_noise_scale": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "offload_device": (get_device_list(include_none=True, include_cpu=True), {"default": "cpu"}),
+                "enable_debug": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "execute"
+    CATEGORY = "SEEDVR2/debug"
+
+    def execute(
+        self,
+        image,
+        native_latent,
+        dit,
+        vae,
+        seed,
+        resolution=1314,
+        max_resolution=4096,
+        batch_size=1,
+        color_correction="lab",
+        latent_noise_scale=0.0,
+        offload_device="cpu",
+        enable_debug=False,
+    ):
+        _ensure_numz_import_path()
+        import torch
+
+        from src.core.generation_phases import decode_all_batches, postprocess_all_batches, upscale_all_batches
+        from src.core.generation_utils import compute_generation_info, prepare_runner, setup_generation_context
+        from src.optimization.memory_manager import cleanup_text_embeddings, complete_cleanup
+        from src.utils.constants import get_base_cache_dir
+        from src.utils.debug import Debug
+
+        debug = Debug(enabled=enable_debug)
+        runner = None
+        ctx = None
+        dit_model = dit["model"]
+        vae_model = vae["model"]
+        dit_device = torch.device(dit["device"])
+        vae_device = torch.device(vae["device"])
+        dit_offload_str = dit.get("offload_device", "none")
+        vae_offload_str = vae.get("offload_device", "none")
+        tensor_offload_device = torch.device(offload_device) if offload_device != "none" else None
+        block_swap_config = None
+        if dit.get("blocks_to_swap", 0) > 0 or dit.get("swap_io_components", False):
+            block_swap_config = {
+                "blocks_to_swap": dit.get("blocks_to_swap", 0),
+                "swap_io_components": dit.get("swap_io_components", False),
+            }
+            if dit_offload_str != "none":
+                block_swap_config["offload_device"] = torch.device(dit_offload_str)
+
+        try:
+            ctx = setup_generation_context(
+                dit_device=dit_device,
+                vae_device=vae_device,
+                dit_offload_device=torch.device(dit_offload_str) if dit_offload_str != "none" else None,
+                vae_offload_device=torch.device(vae_offload_str) if vae_offload_str != "none" else None,
+                tensor_offload_device=tensor_offload_device,
+                debug=debug,
+            )
+            runner, cache_context = prepare_runner(
+                dit_model=dit_model,
+                vae_model=vae_model,
+                model_dir=get_base_cache_dir(),
+                debug=debug,
+                ctx=ctx,
+                dit_cache=dit.get("cache_model", False),
+                vae_cache=vae.get("cache_model", False),
+                dit_id=dit.get("node_id"),
+                vae_id=vae.get("node_id"),
+                block_swap_config=block_swap_config,
+                encode_tiled=vae.get("encode_tiled", False),
+                encode_tile_size=(vae.get("encode_tile_size", 512), vae.get("encode_tile_size", 512)),
+                encode_tile_overlap=(vae.get("encode_tile_overlap", 64), vae.get("encode_tile_overlap", 64)),
+                decode_tiled=vae.get("decode_tiled", False),
+                decode_tile_size=(vae.get("decode_tile_size", 512), vae.get("decode_tile_size", 512)),
+                decode_tile_overlap=(vae.get("decode_tile_overlap", 64), vae.get("decode_tile_overlap", 64)),
+                tile_debug=vae.get("tile_debug", "false"),
+                attention_mode=dit.get("attention_mode", "sdpa"),
+                torch_compile_args_dit=dit.get("torch_compile_args"),
+                torch_compile_args_vae=vae.get("torch_compile_args"),
+            )
+            ctx["cache_context"] = cache_context
+            rgb_image = image[..., :3].contiguous()
+            rgb_image, _ = compute_generation_info(
+                ctx=ctx,
+                images=rgb_image,
+                resolution=resolution,
+                max_resolution=max_resolution,
+                batch_size=batch_size,
+                uniform_batch_size=False,
+                seed=seed,
+                prepend_frames=0,
+                temporal_overlap=0,
+                debug=debug,
+            )
+            ctx["input_images"] = rgb_image
+            ctx["is_rgba"] = False
+            ctx["actual_temporal_overlap"] = 0
+            ctx["all_ori_lengths"] = [rgb_image.shape[0]]
+            ctx["all_latents"] = [_native_latent_to_numz_latent(native_latent)]
+            if color_correction != "none":
+                ctx["batch_metadata"] = [(0, rgb_image.shape[0], 0)]
+
+            ctx = upscale_all_batches(
+                runner,
+                ctx=ctx,
+                debug=debug,
+                seed=seed,
+                latent_noise_scale=latent_noise_scale,
+                cache_model=dit.get("cache_model", False),
+            )
+            ctx = decode_all_batches(
+                runner,
+                ctx=ctx,
+                debug=debug,
+                cache_model=vae.get("cache_model", False),
+            )
+            ctx = postprocess_all_batches(
+                ctx=ctx,
+                debug=debug,
+                color_correction=color_correction,
+                prepend_frames=0,
+                temporal_overlap=0,
+                batch_size=batch_size,
+            )
+            sample = ctx["final_video"]
+            if sample.is_cuda or sample.is_mps:
+                sample = sample.cpu()
+            if sample.dtype != torch.float32:
+                sample = sample.to(torch.float32)
+            return (sample,)
+        finally:
+            if runner is not None:
+                complete_cleanup(
+                    runner=runner,
+                    debug=debug,
+                    dit_cache=dit.get("cache_model", False),
+                    vae_cache=vae.get("cache_model", False),
+                )
+            if ctx is not None:
+                cleanup_text_embeddings(ctx, debug)
+
+
 NODE_CLASS_MAPPINGS = {
     "SeedVR2Analysis": SeedVR2Analysis,
     "SeedVR2EquivalenceAnalysis": SeedVR2EquivalenceAnalysis,
     "SeedVR2WorstFrameFidelityAnalysis": SeedVR2WorstFrameFidelityAnalysis,
     "SeedVR2NumzPreparedConditioningToNative": SeedVR2NumzPreparedConditioningToNative,
     "SeedVR2NumzUpscaledLatentFileToNative": SeedVR2NumzUpscaledLatentFileToNative,
+    "SeedVR2NativeLatentToNumzDiT": SeedVR2NativeLatentToNumzDiT,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2Analysis": "SeedVR2 Analysis",
@@ -2417,4 +2600,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2WorstFrameFidelityAnalysis": "SeedVR2 Worst-Frame Fidelity Analysis",
     "SeedVR2NumzPreparedConditioningToNative": "SeedVR2 Numz Prepared Conditioning -> Native",
     "SeedVR2NumzUpscaledLatentFileToNative": "SeedVR2 Numz Upscaled Latent File -> Native",
+    "SeedVR2NativeLatentToNumzDiT": "SeedVR2 Native Latent -> Numz DiT",
 }
