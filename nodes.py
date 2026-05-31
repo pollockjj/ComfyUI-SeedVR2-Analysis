@@ -2255,13 +2255,166 @@ class SeedVR2WorstFrameFidelityAnalysis:
         return (metrics_json, str(artifact_path), worst_summary)
 
 
+def _seedvr2_numz_root() -> Path:
+    return REPO_ROOT.parent / "ComfyUI-SeedVR2_VideoUpscaler"
+
+
+def _ensure_numz_import_path() -> None:
+    root = str(_seedvr2_numz_root())
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+def _numz_latent_to_native_5d(latent: Any) -> Any:
+    import torch
+
+    if not torch.is_tensor(latent):
+        raise TypeError(f"expected tensor latent, got {type(latent).__name__}")
+    latent = latent.detach()
+    if latent.ndim == 4:
+        latent = latent.unsqueeze(0)
+    if latent.ndim != 5 or latent.shape[-1] != 16:
+        raise ValueError(
+            "expected numz latent shape (T,H,W,16) or (B,T,H,W,16); "
+            f"got {tuple(latent.shape)}"
+        )
+    return latent.movedim(-1, 1).contiguous()
+
+
+def _native_5d_to_collapsed_samples(channel_first: Any) -> dict[str, Any]:
+    b, c, t, h, w = channel_first.shape
+    collapsed = channel_first.reshape(b, c * t, h, w).contiguous()
+    return {"samples": collapsed}
+
+
+def _numz_latent_to_native_samples(latent: Any) -> dict[str, Any]:
+    return _native_5d_to_collapsed_samples(_numz_latent_to_native_5d(latent))
+
+
+class SeedVR2NumzPreparedConditioningToNative:
+    @classmethod
+    def INPUT_TYPES(cls):
+        _ensure_numz_import_path()
+        from src.optimization.memory_manager import get_device_list
+
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "model": ("MODEL",),
+                "vae": ("SEEDVR2_VAE",),
+                "seed": ("INT", {"default": 5770521, "min": 0, "max": 2**32 - 1, "step": 1}),
+                "resolution": ("INT", {"default": 1314, "min": 16, "max": 16384, "step": 2}),
+                "max_resolution": ("INT", {"default": 4096, "min": 0, "max": 16384, "step": 2}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 16384, "step": 1}),
+                "uniform_batch_size": ("BOOLEAN", {"default": False}),
+                "temporal_overlap": ("INT", {"default": 0, "min": 0, "max": 16, "step": 1}),
+                "prepend_frames": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1}),
+                "color_correction": (["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"], {"default": "lab"}),
+                "input_noise_scale": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "offload_device": (get_device_list(include_none=True, include_cpu=True), {"default": "cpu"}),
+                "enable_debug": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "IMAGE", "INT")
+    RETURN_NAMES = ("model", "positive", "negative", "latent", "original_image", "upscaled_shorter_edge")
+    FUNCTION = "execute"
+    CATEGORY = "SEEDVR2/debug"
+
+    def execute(
+        self,
+        image,
+        model,
+        vae,
+        seed,
+        resolution=1314,
+        max_resolution=4096,
+        batch_size=1,
+        uniform_batch_size=False,
+        temporal_overlap=0,
+        prepend_frames=0,
+        color_correction="lab",
+        input_noise_scale=0.0,
+        offload_device="cpu",
+        enable_debug=False,
+    ):
+        _ensure_numz_import_path()
+        from src.interfaces.latent_nodes import SeedVR2VAEEncode
+        from comfy_extras.nodes_seedvr import SeedVR2Conditioning
+
+        encoded = SeedVR2VAEEncode.execute(
+            image=image,
+            vae=vae,
+            seed=seed,
+            resolution=resolution,
+            max_resolution=max_resolution,
+            batch_size=batch_size,
+            uniform_batch_size=uniform_batch_size,
+            temporal_overlap=temporal_overlap,
+            prepend_frames=prepend_frames,
+            color_correction=color_correction,
+            input_noise_scale=input_noise_scale,
+            offload_device=offload_device,
+            enable_debug=enable_debug,
+        )[0]
+        latents = encoded.get("all_latents")
+        if not latents:
+            raise ValueError("numz VAE encode returned no latents")
+        native_5d = _numz_latent_to_native_5d(latents[0])
+        conditioned = SeedVR2Conditioning.execute(model, {"samples": native_5d})
+        return (
+            conditioned[0],
+            conditioned[1],
+            conditioned[2],
+            conditioned[3],
+            image,
+            int(resolution),
+        )
+
+
+class SeedVR2NumzUpscaledLatentFileToNative:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent_path": (
+                    "STRING",
+                    {
+                        "default": str(
+                            Path("/home/johnj/dev_master/mydevelopment")
+                            / "github_issues/283/scratch/numz_upscaled_latent_sharp_fp8_ee8ecf65.pt"
+                        )
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "execute"
+    CATEGORY = "SEEDVR2/debug"
+
+    def execute(self, latent_path):
+        import torch
+
+        path = Path(latent_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"numz upscaled latent file not found: {path}")
+        latent = torch.load(path, map_location="cpu", weights_only=False)
+        return (_numz_latent_to_native_samples(latent),)
+
+
 NODE_CLASS_MAPPINGS = {
     "SeedVR2Analysis": SeedVR2Analysis,
     "SeedVR2EquivalenceAnalysis": SeedVR2EquivalenceAnalysis,
     "SeedVR2WorstFrameFidelityAnalysis": SeedVR2WorstFrameFidelityAnalysis,
+    "SeedVR2NumzPreparedConditioningToNative": SeedVR2NumzPreparedConditioningToNative,
+    "SeedVR2NumzUpscaledLatentFileToNative": SeedVR2NumzUpscaledLatentFileToNative,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2Analysis": "SeedVR2 Analysis",
     "SeedVR2EquivalenceAnalysis": "SeedVR2 Equivalence Analysis (BEST + ROPE)",
     "SeedVR2WorstFrameFidelityAnalysis": "SeedVR2 Worst-Frame Fidelity Analysis",
+    "SeedVR2NumzPreparedConditioningToNative": "SeedVR2 Numz Prepared Conditioning -> Native",
+    "SeedVR2NumzUpscaledLatentFileToNative": "SeedVR2 Numz Upscaled Latent File -> Native",
 }
