@@ -2451,6 +2451,7 @@ class SeedVR2NativeRawDiTProbe:
         original_norm_forward = None
         original_var_attention = None
         original_rope_forward = None
+        original_mm_rope_forward = None
         if norm_override == "fp32":
             original_norm_forward = seedvr_model.CustomRMSNorm.forward
 
@@ -2466,6 +2467,7 @@ class SeedVR2NativeRawDiTProbe:
             seedvr_model.CustomRMSNorm.forward = fp32_norm_forward
         if rope_override == "legacy":
             original_rope_forward = seedvr_model.NaRotaryEmbedding3d.forward
+            original_mm_rope_forward = seedvr_model.NaMMRotaryEmbedding3d.forward
 
             def legacy_rope_forward(self, q, k, shape, cache):
                 freqs = cache("rope_freqs_3d_legacy", lambda: self.get_legacy_freqs(shape))
@@ -2487,6 +2489,19 @@ class SeedVR2NativeRawDiTProbe:
 
             seedvr_model.NaRotaryEmbedding3d.forward = legacy_rope_forward
             seedvr_model.NaRotaryEmbedding3d.get_legacy_freqs = get_legacy_freqs
+
+            def legacy_mm_rope_forward(self, vid_q, vid_k, vid_shape, txt_q, txt_k, txt_shape, cache):
+                freqs = cache("rope_freqs_3d_legacy_plain_video", lambda: self.get_legacy_freqs(vid_shape))
+                freqs = freqs.to(device=vid_q.device, dtype=vid_q.dtype)
+                vid_q = seedvr_model.rearrange(vid_q, "L h d -> h L d")
+                vid_k = seedvr_model.rearrange(vid_k, "L h d -> h L d")
+                vid_q = seedvr_model.apply_rotary_emb(freqs, vid_q.float()).to(vid_q.dtype)
+                vid_k = seedvr_model.apply_rotary_emb(freqs, vid_k.float()).to(vid_k.dtype)
+                vid_q = seedvr_model.rearrange(vid_q, "h L d -> L h d")
+                vid_k = seedvr_model.rearrange(vid_k, "h L d -> L h d")
+                return vid_q, vid_k, txt_q, txt_k
+
+            seedvr_model.NaMMRotaryEmbedding3d.forward = legacy_mm_rope_forward
         if capture_blocks:
             original_var_attention = seedvr_model.optimized_var_attention
             captured_var_attention = {"done": False}
@@ -2526,6 +2541,8 @@ class SeedVR2NativeRawDiTProbe:
                     seedvr_model.optimized_var_attention = original_var_attention
                 if original_rope_forward is not None:
                     seedvr_model.NaRotaryEmbedding3d.forward = original_rope_forward
+                if original_mm_rope_forward is not None:
+                    seedvr_model.NaMMRotaryEmbedding3d.forward = original_mm_rope_forward
                 for handle in hook_handles:
                     handle.remove()
         raw_pred = x_t.float() - denoised.float()
