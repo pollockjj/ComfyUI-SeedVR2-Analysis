@@ -2327,6 +2327,19 @@ def _debug_tensor_stats(tensor: Any) -> dict[str, Any]:
     }
 
 
+def _debug_tensor_probe(tensor: Any, sample_count: int = 4096) -> dict[str, Any]:
+    import torch
+
+    if not torch.is_tensor(tensor):
+        raise TypeError(f"expected tensor, got {type(tensor).__name__}")
+    flat = tensor.detach().float().flatten()
+    sample = flat[: min(sample_count, flat.numel())].cpu()
+    return {
+        "stats": _debug_tensor_stats(tensor),
+        "sample": sample,
+    }
+
+
 class SeedVR2NativeRawDiTProbe:
     @classmethod
     def INPUT_TYPES(cls):
@@ -2343,6 +2356,10 @@ class SeedVR2NativeRawDiTProbe:
                     },
                 ),
             }
+            ,
+            "optional": {
+                "capture_blocks": ("BOOLEAN", {"default": True}),
+            },
         }
 
     RETURN_TYPES = ("STRING",)
@@ -2350,7 +2367,7 @@ class SeedVR2NativeRawDiTProbe:
     CATEGORY = "SEEDVR2/debug"
     OUTPUT_NODE = True
 
-    def execute(self, model, positive, latent_image, seed, output_path):
+    def execute(self, model, positive, latent_image, seed, output_path, capture_blocks=True):
         import torch
         import comfy.model_management
         import comfy.sample
@@ -2384,12 +2401,31 @@ class SeedVR2NativeRawDiTProbe:
         context = context.to(device=device)
         condition = condition.to(device=device)
 
+        block_probes: list[dict[str, Any]] = []
+        transformer_options = {"cond_or_uncond": [0]}
+        if capture_blocks:
+            diffusion_model = model.model.diffusion_model
+            patches_replace = {"dit": {}}
+
+            for block_idx in range(len(diffusion_model.blocks)):
+                def make_block_probe(i):
+                    def block_probe(args, extra):
+                        if i == 0:
+                            block_probes.append({"stage": "block_0_in", "vid": _debug_tensor_probe(args["vid"])})
+                        out = extra["original_block"](args)
+                        block_probes.append({"stage": f"block_{i}_out", "vid": _debug_tensor_probe(out["vid"])})
+                        return out
+                    return block_probe
+
+                patches_replace["dit"][("block", block_idx)] = make_block_probe(block_idx)
+            transformer_options["patches_replace"] = patches_replace
+
         with torch.no_grad():
             denoised = model.model.apply_model(
                 x_t,
                 sigma,
                 c_crossattn=context,
-                transformer_options={"cond_or_uncond": [0]},
+                transformer_options=transformer_options,
                 condition=condition,
             )
         raw_pred = x_t.float() - denoised.float()
@@ -2411,6 +2447,7 @@ class SeedVR2NativeRawDiTProbe:
                 "denoised": _debug_tensor_stats(denoised),
                 "raw_pred": _debug_tensor_stats(raw_pred),
             },
+            "block_probes": block_probes,
             "tensors": {
                 "x_t": x_t.detach().cpu(),
                 "condition": condition.detach().cpu(),
@@ -2462,6 +2499,7 @@ class SeedVR2NumzPreparedConditioningToNative:
                 "input_noise_scale": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
                 "offload_device": (get_device_list(include_none=True, include_cpu=True), {"default": "cpu"}),
                 "enable_debug": ("BOOLEAN", {"default": False}),
+                "capture_blocks": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -2748,7 +2786,7 @@ class SeedVR2NumzRawDiTFromNativeProbe:
     CATEGORY = "SEEDVR2/debug"
     OUTPUT_NODE = True
 
-    def execute(self, dit, vae, native_probe_path, output_path, offload_device="cpu", enable_debug=False):
+    def execute(self, dit, vae, native_probe_path, output_path, offload_device="cpu", enable_debug=False, capture_blocks=True):
         _ensure_numz_import_path()
         import torch
 
@@ -2842,9 +2880,34 @@ class SeedVR2NumzRawDiTFromNativeProbe:
             txt_shape = torch.tensor([[txt.shape[0]]], device=device, dtype=torch.long)
             timestep = torch.tensor([1000.0], device=device, dtype=dtype)
 
+            block_probes: list[dict[str, Any]] = []
+            hook_handles = []
+            if capture_blocks:
+                def pre_block_0(module, inputs, kwargs):
+                    block_probes.append({"stage": "block_0_in", "vid": _debug_tensor_probe(kwargs["vid"])})
+
+                hook_handles.append(runner.dit.blocks[0].register_forward_pre_hook(pre_block_0, with_kwargs=True))
+
+                for block_idx, block in enumerate(runner.dit.blocks):
+                    def make_hook(i):
+                        def hook(module, inputs, kwargs, output):
+                            block_probes.append({"stage": f"block_{i}_out", "vid": _debug_tensor_probe(output[0])})
+                        return hook
+
+                    hook_handles.append(block.register_forward_hook(make_hook(block_idx), with_kwargs=True))
+
             with torch.no_grad():
-                if device.type == "cuda":
-                    with torch.autocast(device.type, dtype, enabled=True):
+                try:
+                    if device.type == "cuda":
+                        with torch.autocast(device.type, dtype, enabled=True):
+                            raw_flat = runner.dit(
+                                vid=vid,
+                                txt=txt,
+                                vid_shape=vid_shape,
+                                txt_shape=txt_shape,
+                                timestep=timestep,
+                            ).vid_sample
+                    else:
                         raw_flat = runner.dit(
                             vid=vid,
                             txt=txt,
@@ -2852,14 +2915,9 @@ class SeedVR2NumzRawDiTFromNativeProbe:
                             txt_shape=txt_shape,
                             timestep=timestep,
                         ).vid_sample
-                else:
-                    raw_flat = runner.dit(
-                        vid=vid,
-                        txt=txt,
-                        vid_shape=vid_shape,
-                        txt_shape=txt_shape,
-                        timestep=timestep,
-                    ).vid_sample
+                finally:
+                    for handle in hook_handles:
+                        handle.remove()
 
             raw_numz = raw_flat.reshape(latent_t, h, w, 16).movedim(-1, 0).reshape(1, 16 * latent_t, h, w)
             native_raw = native["tensors"]["raw_pred"].to(dtype=raw_numz.dtype)
@@ -2879,6 +2937,7 @@ class SeedVR2NumzRawDiTFromNativeProbe:
                     "max_abs": float(diff.abs().max().item()),
                     "mean_abs": float(diff.abs().mean().item()),
                 },
+                "block_probes": block_probes,
                 "tensors": {
                     "raw_numz": raw_numz.detach().cpu(),
                     "native_raw": native_raw.detach().cpu(),
