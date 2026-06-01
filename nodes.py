@@ -2360,6 +2360,7 @@ class SeedVR2NativeRawDiTProbe:
             "optional": {
                 "capture_blocks": ("BOOLEAN", {"default": True}),
                 "norm_override": (["native", "fp32"], {"default": "native"}),
+                "rope_override": (["native", "legacy"], {"default": "native"}),
             },
         }
 
@@ -2368,7 +2369,7 @@ class SeedVR2NativeRawDiTProbe:
     CATEGORY = "SEEDVR2/debug"
     OUTPUT_NODE = True
 
-    def execute(self, model, positive, latent_image, seed, output_path, capture_blocks=True, norm_override="native"):
+    def execute(self, model, positive, latent_image, seed, output_path, capture_blocks=True, norm_override="native", rope_override="native"):
         import torch
         import comfy.model_management
         import comfy.sample
@@ -2449,6 +2450,7 @@ class SeedVR2NativeRawDiTProbe:
 
         original_norm_forward = None
         original_var_attention = None
+        original_rope_forward = None
         if norm_override == "fp32":
             original_norm_forward = seedvr_model.CustomRMSNorm.forward
 
@@ -2462,6 +2464,29 @@ class SeedVR2NativeRawDiTProbe:
                 return normalized
 
             seedvr_model.CustomRMSNorm.forward = fp32_norm_forward
+        if rope_override == "legacy":
+            original_rope_forward = seedvr_model.NaRotaryEmbedding3d.forward
+
+            def legacy_rope_forward(self, q, k, shape, cache):
+                freqs = cache("rope_freqs_3d_legacy", lambda: self.get_legacy_freqs(shape))
+                freqs = freqs.to(device=q.device, dtype=q.dtype)
+                q = seedvr_model.rearrange(q, "L h d -> h L d")
+                k = seedvr_model.rearrange(k, "L h d -> h L d")
+                q = seedvr_model.apply_rotary_emb(freqs, q.float()).to(q.dtype)
+                k = seedvr_model.apply_rotary_emb(freqs, k.float()).to(k.dtype)
+                q = seedvr_model.rearrange(q, "h L d -> L h d")
+                k = seedvr_model.rearrange(k, "h L d -> L h d")
+                return q, k
+
+            def get_legacy_freqs(self, shape):
+                freq_list = []
+                for f, h, w in shape.tolist():
+                    freqs = self.get_axial_freqs(f, h, w)
+                    freq_list.append(freqs.view(-1, freqs.size(-1)))
+                return torch.cat(freq_list, dim=0)
+
+            seedvr_model.NaRotaryEmbedding3d.forward = legacy_rope_forward
+            seedvr_model.NaRotaryEmbedding3d.get_legacy_freqs = get_legacy_freqs
         if capture_blocks:
             original_var_attention = seedvr_model.optimized_var_attention
             captured_var_attention = {"done": False}
@@ -2499,6 +2524,8 @@ class SeedVR2NativeRawDiTProbe:
                     seedvr_model.CustomRMSNorm.forward = original_norm_forward
                 if original_var_attention is not None:
                     seedvr_model.optimized_var_attention = original_var_attention
+                if original_rope_forward is not None:
+                    seedvr_model.NaRotaryEmbedding3d.forward = original_rope_forward
                 for handle in hook_handles:
                     handle.remove()
         raw_pred = x_t.float() - denoised.float()
@@ -2507,6 +2534,7 @@ class SeedVR2NativeRawDiTProbe:
             "schema": "seedvr2_native_raw_dit_probe.v1",
             "seed": seed,
             "norm_override": norm_override,
+            "rope_override": rope_override,
             "sampler_edge": {
                 "sigma": [float(v) for v in sigma.detach().cpu().tolist()],
                 "scheduler": "simple",
