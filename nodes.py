@@ -2359,6 +2359,7 @@ class SeedVR2NativeRawDiTProbe:
             ,
             "optional": {
                 "capture_blocks": ("BOOLEAN", {"default": True}),
+                "norm_override": (["native", "fp32"], {"default": "native"}),
             },
         }
 
@@ -2367,10 +2368,11 @@ class SeedVR2NativeRawDiTProbe:
     CATEGORY = "SEEDVR2/debug"
     OUTPUT_NODE = True
 
-    def execute(self, model, positive, latent_image, seed, output_path, capture_blocks=True):
+    def execute(self, model, positive, latent_image, seed, output_path, capture_blocks=True, norm_override="native"):
         import torch
         import comfy.model_management
         import comfy.sample
+        import comfy.ldm.seedvr.model as seedvr_model
 
         path = Path(output_path)
         if "/scratch/" not in str(path):
@@ -2439,6 +2441,21 @@ class SeedVR2NativeRawDiTProbe:
                 patches_replace["dit"][("block", block_idx)] = make_block_probe(block_idx)
             transformer_options["patches_replace"] = patches_replace
 
+        original_norm_forward = None
+        if norm_override == "fp32":
+            original_norm_forward = seedvr_model.CustomRMSNorm.forward
+
+            def fp32_norm_forward(self, input):
+                dims = tuple(range(-len(self.normalized_shape), 0))
+                work = input.float()
+                variance = work.pow(2).mean(dim=dims, keepdim=True)
+                normalized = work / torch.sqrt(variance + self.eps)
+                if self.elementwise_affine:
+                    return normalized * self.weight.to(normalized.dtype)
+                return normalized
+
+            seedvr_model.CustomRMSNorm.forward = fp32_norm_forward
+
         with torch.no_grad():
             try:
                 denoised = model.model.apply_model(
@@ -2449,6 +2466,8 @@ class SeedVR2NativeRawDiTProbe:
                     condition=condition,
                 )
             finally:
+                if original_norm_forward is not None:
+                    seedvr_model.CustomRMSNorm.forward = original_norm_forward
                 for handle in hook_handles:
                     handle.remove()
         raw_pred = x_t.float() - denoised.float()
@@ -2456,6 +2475,7 @@ class SeedVR2NativeRawDiTProbe:
         artifact = {
             "schema": "seedvr2_native_raw_dit_probe.v1",
             "seed": seed,
+            "norm_override": norm_override,
             "sampler_edge": {
                 "sigma": [float(v) for v in sigma.detach().cpu().tolist()],
                 "scheduler": "simple",
