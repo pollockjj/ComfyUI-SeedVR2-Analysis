@@ -2600,7 +2600,7 @@ class SeedVR2NativeLatentToNumzDiT:
 
         from src.core.generation_phases import decode_all_batches, postprocess_all_batches, upscale_all_batches
         from src.core.generation_utils import compute_generation_info, prepare_runner, setup_generation_context
-        from src.optimization.memory_manager import cleanup_text_embeddings, complete_cleanup
+        from src.optimization.memory_manager import cleanup_text_embeddings, complete_cleanup, manage_model_device
         from src.utils.constants import get_base_cache_dir
         from src.utils.debug import Debug
 
@@ -2812,6 +2812,13 @@ class SeedVR2NumzRawDiTFromNativeProbe:
                 torch_compile_args_vae=vae.get("torch_compile_args"),
             )
             ctx["cache_context"] = cache_context
+            manage_model_device(
+                model=runner.dit,
+                target_device=ctx["dit_device"],
+                model_name="DiT",
+                debug=debug,
+                runner=runner,
+            )
 
             device = ctx["dit_device"]
             dtype = ctx["compute_dtype"]
