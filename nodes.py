@@ -2753,7 +2753,7 @@ class SeedVR2NumzRawDiTFromNativeProbe:
         import torch
 
         from src.core.generation_utils import prepare_runner, setup_generation_context
-        from src.optimization.memory_manager import cleanup_text_embeddings, complete_cleanup
+        from src.optimization.memory_manager import cleanup_text_embeddings, complete_cleanup, manage_model_device
         from src.utils.constants import get_base_cache_dir
         from src.utils.debug import Debug
 
