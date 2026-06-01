@@ -2466,6 +2466,8 @@ class SeedVR2NativeRawDiTProbe:
 
             seedvr_model.CustomRMSNorm.forward = fp32_norm_forward
         if rope_override == "legacy":
+            from rotary_embedding_torch import apply_rotary_emb as legacy_apply_rotary_emb
+
             original_rope_forward = seedvr_model.NaRotaryEmbedding3d.forward
             original_mm_rope_forward = seedvr_model.NaMMRotaryEmbedding3d.forward
 
@@ -2474,8 +2476,8 @@ class SeedVR2NativeRawDiTProbe:
                 freqs = freqs.to(device=q.device, dtype=q.dtype)
                 q = seedvr_model.rearrange(q, "L h d -> h L d")
                 k = seedvr_model.rearrange(k, "L h d -> h L d")
-                q = seedvr_model.apply_rotary_emb(freqs, q.float()).to(q.dtype)
-                k = seedvr_model.apply_rotary_emb(freqs, k.float()).to(k.dtype)
+                q = legacy_apply_rotary_emb(freqs, q.float()).to(q.dtype)
+                k = legacy_apply_rotary_emb(freqs, k.float()).to(k.dtype)
                 q = seedvr_model.rearrange(q, "h L d -> L h d")
                 k = seedvr_model.rearrange(k, "h L d -> L h d")
                 return q, k
@@ -2495,8 +2497,8 @@ class SeedVR2NativeRawDiTProbe:
                 freqs = freqs.to(device=vid_q.device, dtype=vid_q.dtype)
                 vid_q = seedvr_model.rearrange(vid_q, "L h d -> h L d")
                 vid_k = seedvr_model.rearrange(vid_k, "L h d -> h L d")
-                vid_q = seedvr_model.apply_rotary_emb(freqs, vid_q.float()).to(vid_q.dtype)
-                vid_k = seedvr_model.apply_rotary_emb(freqs, vid_k.float()).to(vid_k.dtype)
+                vid_q = legacy_apply_rotary_emb(freqs, vid_q.float()).to(vid_q.dtype)
+                vid_k = legacy_apply_rotary_emb(freqs, vid_k.float()).to(vid_k.dtype)
                 vid_q = seedvr_model.rearrange(vid_q, "h L d -> L h d")
                 vid_k = seedvr_model.rearrange(vid_k, "h L d -> L h d")
                 return vid_q, vid_k, txt_q, txt_k
