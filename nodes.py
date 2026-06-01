@@ -2402,9 +2402,28 @@ class SeedVR2NativeRawDiTProbe:
         condition = condition.to(device=device)
 
         block_probes: list[dict[str, Any]] = []
+        submodule_probes: list[dict[str, Any]] = []
+        hook_handles = []
         transformer_options = {"cond_or_uncond": [0]}
         if capture_blocks:
             diffusion_model = model.model.diffusion_model
+            block0 = diffusion_model.blocks[0]
+
+            def add_submodule_probe(name, module):
+                def hook(mod, inputs, kwargs, output):
+                    stage = name
+                    if name.endswith(".ada"):
+                        stage = f"{name}.{kwargs.get('layer', 'unknown')}.{kwargs.get('mode', 'unknown')}"
+                    vid_out = output[0] if isinstance(output, tuple) else output
+                    submodule_probes.append({"stage": stage, "vid": _debug_tensor_probe(vid_out)})
+                hook_handles.append(module.register_forward_hook(hook, with_kwargs=True))
+
+            add_submodule_probe("block_0.attn_norm", block0.attn_norm)
+            add_submodule_probe("block_0.ada", block0.ada)
+            add_submodule_probe("block_0.attn", block0.attn)
+            add_submodule_probe("block_0.mlp_norm", block0.mlp_norm)
+            add_submodule_probe("block_0.mlp", block0.mlp)
+
             patches_replace = {"dit": {}}
 
             for block_idx in range(len(diffusion_model.blocks)):
@@ -2421,13 +2440,17 @@ class SeedVR2NativeRawDiTProbe:
             transformer_options["patches_replace"] = patches_replace
 
         with torch.no_grad():
-            denoised = model.model.apply_model(
-                x_t,
-                sigma,
-                c_crossattn=context,
-                transformer_options=transformer_options,
-                condition=condition,
-            )
+            try:
+                denoised = model.model.apply_model(
+                    x_t,
+                    sigma,
+                    c_crossattn=context,
+                    transformer_options=transformer_options,
+                    condition=condition,
+                )
+            finally:
+                for handle in hook_handles:
+                    handle.remove()
         raw_pred = x_t.float() - denoised.float()
 
         artifact = {
@@ -2448,6 +2471,7 @@ class SeedVR2NativeRawDiTProbe:
                 "raw_pred": _debug_tensor_stats(raw_pred),
             },
             "block_probes": block_probes,
+            "submodule_probes": submodule_probes,
             "tensors": {
                 "x_t": x_t.detach().cpu(),
                 "condition": condition.detach().cpu(),
@@ -2881,8 +2905,26 @@ class SeedVR2NumzRawDiTFromNativeProbe:
             timestep = torch.tensor([1000.0], device=device, dtype=dtype)
 
             block_probes: list[dict[str, Any]] = []
+            submodule_probes: list[dict[str, Any]] = []
             hook_handles = []
             if capture_blocks:
+                block0 = runner.dit.blocks[0]
+
+                def add_submodule_probe(name, module):
+                    def hook(mod, inputs, kwargs, output):
+                        stage = name
+                        if name.endswith(".ada"):
+                            stage = f"{name}.{kwargs.get('layer', 'unknown')}.{kwargs.get('mode', 'unknown')}"
+                        vid_out = output[0] if isinstance(output, tuple) else output
+                        submodule_probes.append({"stage": stage, "vid": _debug_tensor_probe(vid_out)})
+                    hook_handles.append(module.register_forward_hook(hook, with_kwargs=True))
+
+                add_submodule_probe("block_0.attn_norm", block0.attn_norm)
+                add_submodule_probe("block_0.ada", block0.ada)
+                add_submodule_probe("block_0.attn", block0.attn)
+                add_submodule_probe("block_0.mlp_norm", block0.mlp_norm)
+                add_submodule_probe("block_0.mlp", block0.mlp)
+
                 def pre_block_0(module, inputs, kwargs):
                     block_probes.append({"stage": "block_0_in", "vid": _debug_tensor_probe(kwargs["vid"])})
 
@@ -2938,6 +2980,7 @@ class SeedVR2NumzRawDiTFromNativeProbe:
                     "mean_abs": float(diff.abs().mean().item()),
                 },
                 "block_probes": block_probes,
+                "submodule_probes": submodule_probes,
                 "tensors": {
                     "raw_numz": raw_numz.detach().cpu(),
                     "native_raw": native_raw.detach().cpu(),
