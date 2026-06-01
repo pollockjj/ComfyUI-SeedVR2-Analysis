@@ -2560,6 +2560,13 @@ class SeedVR2NativeRawDiTProbe:
             "seed": seed,
             "norm_override": norm_override,
             "rope_override": rope_override,
+            "block0_rope": {
+                "class": type(diffusion_model.blocks[0].attn.rope).__name__ if capture_blocks else None,
+                "mm": getattr(diffusion_model.blocks[0].attn.rope, "mm", None) if capture_blocks else None,
+                "freqs_for": getattr(getattr(diffusion_model.blocks[0].attn.rope, "rope", None), "freqs_for", None) if capture_blocks else None,
+                "block_version_7b": getattr(diffusion_model.blocks[0], "version", None) if capture_blocks else None,
+                "model_7b_version": getattr(diffusion_model, "_7b_version", None),
+            },
             "sampler_edge": {
                 "sigma": [float(v) for v in sigma.detach().cpu().tolist()],
                 "scheduler": "simple",
