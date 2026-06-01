@@ -35,6 +35,7 @@ Fail-loud paths:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -933,6 +934,7 @@ class SeedVR2Analysis:
 
 EQUIVALENCE_SCHEMA_VERSION = "2.2"
 WORST_FRAME_SCHEMA_VERSION = "1.0"
+IMAGE_COMPARISON_SCHEMA_VERSION = "1.0"
 FAST_VISUAL_FIDELITY_METRICS = ("psnr", "ssim", "lpips", "dists")
 
 # Direction: True iff higher metric value = better quality.
@@ -955,7 +957,304 @@ METRIC_HIGHER_IS_BETTER = {
     "hue_mae_deg": False,
     "lab_hist_w1": False,
     "niqe": False,
+    "alpha_mae": False,
+    "alpha_psnr": True,
 }
+
+
+class SeedVR2ImageComparisonAnalysis:
+    """Full-reference comparison for SeedVR2 still-image validation sets."""
+
+    def __init__(self, metric_backend=None):
+        self._metric_backend = metric_backend
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "reference": ("IMAGE",),
+                "floor": ("IMAGE",),
+                "input1": ("IMAGE",),
+                "input2": ("IMAGE",),
+            },
+            "optional": {
+                "input1_label": ("STRING", {"default": "input1"}),
+                "input2_label": ("STRING", {"default": "input2"}),
+                "lpips_backbone": (["alex", "vgg"], {"default": "alex"}),
+                "enable_psnr": ("BOOLEAN", {"default": True}),
+                "enable_ssim": ("BOOLEAN", {"default": True}),
+                "enable_lpips": ("BOOLEAN", {"default": True}),
+                "enable_dists": ("BOOLEAN", {"default": True}),
+                "enable_color_metrics": ("BOOLEAN", {"default": False}),
+                "output_directory": ("STRING", {"default": ""}),
+                "output_filename": ("STRING", {"default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("metrics_json", "artifact_path", "summary")
+    FUNCTION = "analyze"
+    CATEGORY = "image/analysis"
+    OUTPUT_NODE = True
+
+    @staticmethod
+    def _artifact_dir() -> Path:
+        try:
+            import folder_paths
+            return Path(folder_paths.get_output_directory()) / "seedvr2_analysis"
+        except Exception:
+            return REPO_ROOT / "outputs" / "seedvr2_analysis"
+
+    @staticmethod
+    def _image_label(value) -> str:
+        shape = getattr(value, "shape", None)
+        return f"IMAGE{tuple(shape)}" if shape is not None else repr(type(value).__name__)
+
+    @staticmethod
+    def _split_rgb_alpha(image, name: str):
+        import torch
+
+        if not isinstance(image, torch.Tensor):
+            raise TypeError(f"{name} must be a torch IMAGE tensor")
+        if image.dim() != 4:
+            raise ValueError(f"{name} must be (N, H, W, C); got shape {tuple(image.shape)}")
+        channels = image.shape[-1]
+        if channels not in (1, 3, 4):
+            raise ValueError(f"{name} must have 1, 3, or 4 channels; got {channels}")
+        image = image.detach().to(dtype=torch.float32).clamp(0.0, 1.0).contiguous()
+        if channels == 1:
+            return image.expand(-1, -1, -1, 3).contiguous(), None
+        if channels == 3:
+            return image, None
+        return image[..., :3].contiguous(), image[..., 3].contiguous()
+
+    @staticmethod
+    def _broadcast_batch(tensor, count: int, name: str):
+        if tensor is None:
+            return None
+        if tensor.shape[0] == count:
+            return tensor
+        if tensor.shape[0] == 1:
+            return tensor.expand(count, *tensor.shape[1:]).contiguous()
+        raise ValueError(f"{name} batch count {tensor.shape[0]} cannot broadcast to {count}")
+
+    @classmethod
+    def _normalize_inputs(cls, images: dict[str, Any]):
+        split = {name: cls._split_rgb_alpha(image, name) for name, image in images.items()}
+        batch_count = max(rgb.shape[0] for rgb, _ in split.values())
+        out = {}
+        for name, (rgb, alpha) in split.items():
+            out[name] = (
+                cls._broadcast_batch(rgb, batch_count, f"{name}.rgb"),
+                cls._broadcast_batch(alpha, batch_count, f"{name}.alpha"),
+            )
+        return out
+
+    @staticmethod
+    def _resize_nhwc(images, height: int, width: int):
+        import torch.nn.functional as F
+
+        if images.shape[1] == height and images.shape[2] == width:
+            return images
+        channels_first = images.permute(0, 3, 1, 2)
+        resized = F.interpolate(
+            channels_first,
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+        return resized.permute(0, 2, 3, 1).contiguous()
+
+    @staticmethod
+    def _resize_alpha(alpha, height: int, width: int):
+        import torch.nn.functional as F
+
+        if alpha.shape[1] == height and alpha.shape[2] == width:
+            return alpha
+        resized = F.interpolate(
+            alpha.unsqueeze(1),
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+        return resized.squeeze(1).contiguous()
+
+    @classmethod
+    def _score_images(cls, backend, candidate_rgb, candidate_alpha, reference_rgb, reference_alpha, enabled: set[str]):
+        import torch
+
+        height, width = reference_rgb.shape[1:3]
+        candidate_rgb = cls._resize_nhwc(candidate_rgb, height, width).clamp(0.0, 1.0)
+        if reference_alpha is not None:
+            if candidate_alpha is None:
+                candidate_alpha = torch.ones_like(reference_alpha)
+            else:
+                candidate_alpha = cls._resize_alpha(candidate_alpha, height, width).clamp(0.0, 1.0)
+            candidate_fr = candidate_rgb * candidate_alpha.unsqueeze(-1)
+            reference_fr = reference_rgb * reference_alpha.unsqueeze(-1)
+        else:
+            candidate_fr = candidate_rgb
+            reference_fr = reference_rgb
+
+        metrics = backend.compute_fr_metrics(candidate_fr, reference_fr, enabled=enabled)
+        if reference_alpha is not None:
+            alpha_delta = candidate_alpha - reference_alpha
+            alpha_mae = alpha_delta.abs().mean(dim=(1, 2))
+            alpha_mse = alpha_delta.square().mean(dim=(1, 2))
+            alpha_psnr = [
+                99.0 if float(mse) <= 1e-12 else float(10.0 * math.log10(1.0 / float(mse)))
+                for mse in alpha_mse
+            ]
+            metrics["alpha_mae"] = _aggregate([float(v) for v in alpha_mae])
+            metrics["alpha_psnr"] = _aggregate(alpha_psnr)
+        return metrics
+
+    @staticmethod
+    def _enabled_metrics(enable_psnr, enable_ssim, enable_lpips, enable_dists, enable_color_metrics) -> set[str]:
+        enabled: set[str] = set()
+        if enable_psnr:
+            enabled.add("psnr")
+        if enable_ssim:
+            enabled.add("ssim")
+        if enable_lpips:
+            enabled.add("lpips")
+        if enable_dists:
+            enabled.add("dists")
+        if enable_color_metrics:
+            enabled.update(COLOR_METRIC_NAMES)
+        return enabled
+
+    @staticmethod
+    def _winner(value1: float, value2: float, label1: str, label2: str, higher_is_better: bool) -> str:
+        if value1 == value2:
+            return "tie"
+        if higher_is_better:
+            return label1 if value1 > value2 else label2
+        return label1 if value1 < value2 else label2
+
+    @staticmethod
+    def _beats_floor(value: float, floor_value: float, higher_is_better: bool) -> bool:
+        if value == floor_value:
+            return False
+        return value > floor_value if higher_is_better else value < floor_value
+
+    def analyze(
+        self,
+        reference,
+        floor,
+        input1,
+        input2,
+        input1_label: str = "input1",
+        input2_label: str = "input2",
+        lpips_backbone: str = "alex",
+        enable_psnr: bool = True,
+        enable_ssim: bool = True,
+        enable_lpips: bool = True,
+        enable_dists: bool = True,
+        enable_color_metrics: bool = False,
+        output_directory: str = "",
+        output_filename: str = "",
+    ):
+        label1 = input1_label.strip() or "input1"
+        label2 = input2_label.strip() or "input2"
+        if label1 == label2 or label1 == "floor" or label2 == "floor":
+            raise ValueError("input labels must be non-empty and distinct from each other and 'floor'")
+
+        if output_directory.strip():
+            artifact_dir = Path(output_directory).expanduser().resolve()
+        else:
+            artifact_dir = self._artifact_dir()
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        if output_filename.strip():
+            fname = output_filename.strip()
+            if not fname.lower().endswith(".json"):
+                fname = fname + ".json"
+        else:
+            fname = f"seedvr2_image_comparison_{uuid.uuid4().hex}.json"
+        artifact_path = artifact_dir / fname
+
+        normalized = self._normalize_inputs({
+            "reference": reference,
+            "floor": floor,
+            label1: input1,
+            label2: input2,
+        })
+        reference_rgb, reference_alpha = normalized["reference"]
+        height, width = reference_rgb.shape[1:3]
+        batch_count = reference_rgb.shape[0]
+        enabled = self._enabled_metrics(
+            enable_psnr,
+            enable_ssim,
+            enable_lpips,
+            enable_dists,
+            enable_color_metrics,
+        )
+        backend = self._metric_backend or SeedVR2MetricBackend(lpips_backbone=lpips_backbone)
+        leg_metrics = {}
+        for name in ("floor", label1, label2):
+            rgb, alpha = normalized[name]
+            leg_metrics[name] = self._score_images(
+                backend,
+                rgb,
+                alpha,
+                reference_rgb,
+                reference_alpha,
+                enabled,
+            )
+
+        metric_names = [m for m in FR_METRIC_NAMES if m in leg_metrics[label1]]
+        if reference_alpha is not None:
+            metric_names.extend([m for m in ("alpha_mae", "alpha_psnr") if m in leg_metrics[label1]])
+
+        rows: list[dict[str, Any]] = []
+        wins = {label1: 0, label2: 0}
+        for metric_name in metric_names:
+            higher_is_better = METRIC_HIGHER_IS_BETTER[metric_name]
+            v1 = float(leg_metrics[label1][metric_name]["mean"])
+            v2 = float(leg_metrics[label2][metric_name]["mean"])
+            vf = float(leg_metrics["floor"][metric_name]["mean"])
+            winner = self._winner(v1, v2, label1, label2, higher_is_better)
+            if winner in wins:
+                wins[winner] += 1
+            rows.append({
+                "metric": metric_name,
+                "direction": "higher" if higher_is_better else "lower",
+                label1: v1,
+                label2: v2,
+                "floor": vf,
+                "winner": winner,
+                f"{label1}_beats_floor": self._beats_floor(v1, vf, higher_is_better),
+                f"{label2}_beats_floor": self._beats_floor(v2, vf, higher_is_better),
+            })
+
+        verdict = label1 if wins[label1] > wins[label2] else (label2 if wins[label2] > wins[label1] else "tie")
+        summary = f"metric wins: {label1}={wins[label1]} {label2}={wins[label2]} verdict={verdict}"
+        metrics_doc = {
+            "schema_version": IMAGE_COMPARISON_SCHEMA_VERSION,
+            "node": "SeedVR2ImageComparisonAnalysis",
+            "inputs": {
+                "reference": self._image_label(reference),
+                "floor": self._image_label(floor),
+                label1: self._image_label(input1),
+                label2: self._image_label(input2),
+            },
+            "images": {
+                "batch_count": int(batch_count),
+                "width": int(width),
+                "height": int(height),
+                "reference_has_alpha": reference_alpha is not None,
+            },
+            "metrics": rows,
+            "raw_metrics": leg_metrics,
+            "metric_wins": wins,
+            "verdict": verdict,
+            "tool_provenance": SeedVR2WorstFrameFidelityAnalysis._tool_provenance(),
+        }
+        metrics_json = json.dumps(metrics_doc, indent=2)
+        artifact_path.write_text(metrics_json, encoding="utf-8")
+        return (metrics_json, str(artifact_path), summary)
 
 
 def _bayes_normal_posterior_decision(
@@ -3146,6 +3445,7 @@ class SeedVR2NumzRawDiTFromNativeProbe:
 
 NODE_CLASS_MAPPINGS = {
     "SeedVR2Analysis": SeedVR2Analysis,
+    "SeedVR2ImageComparisonAnalysis": SeedVR2ImageComparisonAnalysis,
     "SeedVR2EquivalenceAnalysis": SeedVR2EquivalenceAnalysis,
     "SeedVR2WorstFrameFidelityAnalysis": SeedVR2WorstFrameFidelityAnalysis,
     "SeedVR2NumzPreparedConditioningToNative": SeedVR2NumzPreparedConditioningToNative,
@@ -3156,6 +3456,7 @@ NODE_CLASS_MAPPINGS = {
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2Analysis": "SeedVR2 Analysis",
+    "SeedVR2ImageComparisonAnalysis": "SeedVR2 Image Comparison Analysis",
     "SeedVR2EquivalenceAnalysis": "SeedVR2 Equivalence Analysis (BEST + ROPE)",
     "SeedVR2WorstFrameFidelityAnalysis": "SeedVR2 Worst-Frame Fidelity Analysis",
     "SeedVR2NumzPreparedConditioningToNative": "SeedVR2 Numz Prepared Conditioning -> Native",
