@@ -2716,6 +2716,194 @@ class SeedVR2NativeLatentToNumzDiT:
                 cleanup_text_embeddings(ctx, debug)
 
 
+class SeedVR2NumzRawDiTFromNativeProbe:
+    @classmethod
+    def INPUT_TYPES(cls):
+        _ensure_numz_import_path()
+        from src.optimization.memory_manager import get_device_list
+
+        return {
+            "required": {
+                "dit": ("SEEDVR2_DIT",),
+                "vae": ("SEEDVR2_VAE",),
+                "native_probe_path": (
+                    "STRING",
+                    {
+                        "default": "/home/johnj/dev_master/mydevelopment/github_issues/283/scratch/divergence_probe/native_raw_dit_probe.pt",
+                    },
+                ),
+                "output_path": (
+                    "STRING",
+                    {
+                        "default": "/home/johnj/dev_master/mydevelopment/github_issues/283/scratch/divergence_probe/numz_raw_from_native_probe.pt",
+                    },
+                ),
+                "offload_device": (get_device_list(include_none=True, include_cpu=True), {"default": "cpu"}),
+                "enable_debug": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "execute"
+    CATEGORY = "SEEDVR2/debug"
+    OUTPUT_NODE = True
+
+    def execute(self, dit, vae, native_probe_path, output_path, offload_device="cpu", enable_debug=False):
+        _ensure_numz_import_path()
+        import torch
+
+        from src.core.generation_utils import prepare_runner, setup_generation_context
+        from src.optimization.memory_manager import cleanup_text_embeddings, complete_cleanup
+        from src.utils.constants import get_base_cache_dir
+        from src.utils.debug import Debug
+
+        output = Path(output_path)
+        if "/scratch/" not in str(output):
+            raise ValueError(f"SeedVR2NumzRawDiTFromNativeProbe output_path must be under a scratch directory: {output}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        probe_path = Path(native_probe_path)
+        native = torch.load(probe_path, map_location="cpu", weights_only=False)
+
+        debug = Debug(enabled=enable_debug)
+        runner = None
+        ctx = None
+        dit_offload_str = dit.get("offload_device", "none")
+        vae_offload_str = vae.get("offload_device", "none")
+        tensor_offload_device = torch.device(offload_device) if offload_device != "none" else None
+        block_swap_config = None
+        if dit.get("blocks_to_swap", 0) > 0 or dit.get("swap_io_components", False):
+            block_swap_config = {
+                "blocks_to_swap": dit.get("blocks_to_swap", 0),
+                "swap_io_components": dit.get("swap_io_components", False),
+            }
+            if dit_offload_str != "none":
+                block_swap_config["offload_device"] = torch.device(dit_offload_str)
+
+        try:
+            ctx = setup_generation_context(
+                dit_device=torch.device(dit["device"]),
+                vae_device=torch.device(vae["device"]),
+                dit_offload_device=torch.device(dit_offload_str) if dit_offload_str != "none" else None,
+                vae_offload_device=torch.device(vae_offload_str) if vae_offload_str != "none" else None,
+                tensor_offload_device=tensor_offload_device,
+                debug=debug,
+            )
+            runner, cache_context = prepare_runner(
+                dit_model=dit["model"],
+                vae_model=vae["model"],
+                model_dir=get_base_cache_dir(),
+                debug=debug,
+                ctx=ctx,
+                dit_cache=dit.get("cache_model", False),
+                vae_cache=vae.get("cache_model", False),
+                dit_id=dit.get("node_id"),
+                vae_id=vae.get("node_id"),
+                block_swap_config=block_swap_config,
+                encode_tiled=vae.get("encode_tiled", False),
+                encode_tile_size=(vae.get("encode_tile_size", 512), vae.get("encode_tile_size", 512)),
+                encode_tile_overlap=(vae.get("encode_tile_overlap", 64), vae.get("encode_tile_overlap", 64)),
+                decode_tiled=vae.get("decode_tiled", False),
+                decode_tile_size=(vae.get("decode_tile_size", 512), vae.get("decode_tile_size", 512)),
+                decode_tile_overlap=(vae.get("decode_tile_overlap", 64), vae.get("decode_tile_overlap", 64)),
+                tile_debug=vae.get("tile_debug", "false"),
+                attention_mode=dit.get("attention_mode", "sdpa"),
+                torch_compile_args_dit=dit.get("torch_compile_args"),
+                torch_compile_args_vae=vae.get("torch_compile_args"),
+            )
+            ctx["cache_context"] = cache_context
+
+            device = ctx["dit_device"]
+            dtype = ctx["compute_dtype"]
+            x_t = native["tensors"]["x_t"].to(device=device, dtype=dtype)
+            condition = native["tensors"]["condition"].to(device=device, dtype=dtype)
+            context = native["tensors"]["context"].to(device=device, dtype=dtype)
+
+            b, ct, h, w = x_t.shape
+            if b != 1 or ct % 16 != 0:
+                raise ValueError(f"expected native x_t shape (1,16*T,H,W), got {tuple(x_t.shape)}")
+            latent_t = ct // 16
+            x_numz = x_t.reshape(b, 16, latent_t, h, w)[0].movedim(0, -1).contiguous()
+            cond_numz = condition.reshape(b, 17, latent_t, h, w)[0].movedim(0, -1).contiguous()
+            vid = torch.cat([x_numz.flatten(0, -2), cond_numz.flatten(0, -2)], dim=-1)
+            vid_shape = torch.tensor([[latent_t, h, w]], device=device, dtype=torch.long)
+            txt = context.squeeze(0).contiguous()
+            txt_shape = torch.tensor([[txt.shape[0]]], device=device, dtype=torch.long)
+            timestep = torch.tensor([1000.0], device=device, dtype=dtype)
+
+            with torch.no_grad():
+                if device.type == "cuda":
+                    with torch.autocast(device.type, dtype, enabled=True):
+                        raw_flat = runner.dit(
+                            vid=vid,
+                            txt=txt,
+                            vid_shape=vid_shape,
+                            txt_shape=txt_shape,
+                            timestep=timestep,
+                        ).vid_sample
+                else:
+                    raw_flat = runner.dit(
+                        vid=vid,
+                        txt=txt,
+                        vid_shape=vid_shape,
+                        txt_shape=txt_shape,
+                        timestep=timestep,
+                    ).vid_sample
+
+            raw_numz = raw_flat.reshape(latent_t, h, w, 16).movedim(-1, 0).reshape(1, 16 * latent_t, h, w)
+            native_raw = native["tensors"]["raw_pred"].to(dtype=raw_numz.dtype)
+            diff = raw_numz.detach().cpu().float() - native_raw.detach().cpu().float()
+
+            artifact = {
+                "schema": "seedvr2_numz_raw_from_native_probe.v1",
+                "native_probe_path": str(probe_path),
+                "stats": {
+                    "vid": _debug_tensor_stats(vid),
+                    "txt": _debug_tensor_stats(txt),
+                    "raw_numz": _debug_tensor_stats(raw_numz),
+                    "native_raw": _debug_tensor_stats(native_raw),
+                    "diff": _debug_tensor_stats(diff),
+                },
+                "diff": {
+                    "max_abs": float(diff.abs().max().item()),
+                    "mean_abs": float(diff.abs().mean().item()),
+                },
+                "tensors": {
+                    "raw_numz": raw_numz.detach().cpu(),
+                    "native_raw": native_raw.detach().cpu(),
+                    "diff": diff.detach().cpu(),
+                },
+            }
+            torch.save(artifact, output)
+            sidecar = output.with_suffix(".json")
+            sidecar.write_text(
+                json.dumps(
+                    {
+                        "path": str(output),
+                        "sha256": _file_sha256(output),
+                        "schema": artifact["schema"],
+                        "stats": artifact["stats"],
+                        "diff": artifact["diff"],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return (str(sidecar),)
+        finally:
+            if runner is not None:
+                complete_cleanup(
+                    runner=runner,
+                    debug=debug,
+                    dit_cache=dit.get("cache_model", False),
+                    vae_cache=vae.get("cache_model", False),
+                )
+            if ctx is not None:
+                cleanup_text_embeddings(ctx, debug)
+
+
 NODE_CLASS_MAPPINGS = {
     "SeedVR2Analysis": SeedVR2Analysis,
     "SeedVR2EquivalenceAnalysis": SeedVR2EquivalenceAnalysis,
@@ -2724,6 +2912,7 @@ NODE_CLASS_MAPPINGS = {
     "SeedVR2NumzUpscaledLatentFileToNative": SeedVR2NumzUpscaledLatentFileToNative,
     "SeedVR2NativeLatentToNumzDiT": SeedVR2NativeLatentToNumzDiT,
     "SeedVR2NativeRawDiTProbe": SeedVR2NativeRawDiTProbe,
+    "SeedVR2NumzRawDiTFromNativeProbe": SeedVR2NumzRawDiTFromNativeProbe,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2Analysis": "SeedVR2 Analysis",
@@ -2733,4 +2922,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2NumzUpscaledLatentFileToNative": "SeedVR2 Numz Upscaled Latent File -> Native",
     "SeedVR2NativeLatentToNumzDiT": "SeedVR2 Native Latent -> Numz DiT",
     "SeedVR2NativeRawDiTProbe": "SeedVR2 Native Raw DiT Probe",
+    "SeedVR2NumzRawDiTFromNativeProbe": "SeedVR2 Numz Raw DiT From Native Probe",
 }
