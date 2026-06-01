@@ -2423,6 +2423,12 @@ class SeedVR2NativeRawDiTProbe:
             add_submodule_probe("block_0.attn_norm", block0.attn_norm)
             add_submodule_probe("block_0.ada", block0.ada)
             add_submodule_probe("block_0.attn", block0.attn)
+            add_submodule_probe("block_0.attn.proj_qkv", block0.attn.proj_qkv)
+            add_submodule_probe("block_0.attn.norm_q", block0.attn.norm_q)
+            add_submodule_probe("block_0.attn.norm_k", block0.attn.norm_k)
+            if block0.attn.rope is not None:
+                add_submodule_probe("block_0.attn.rope", block0.attn.rope)
+            add_submodule_probe("block_0.attn.proj_out", block0.attn.proj_out)
             add_submodule_probe("block_0.mlp_norm", block0.mlp_norm)
             add_submodule_probe("block_0.mlp", block0.mlp)
 
@@ -2442,6 +2448,7 @@ class SeedVR2NativeRawDiTProbe:
             transformer_options["patches_replace"] = patches_replace
 
         original_norm_forward = None
+        original_var_attention = None
         if norm_override == "fp32":
             original_norm_forward = seedvr_model.CustomRMSNorm.forward
 
@@ -2455,6 +2462,28 @@ class SeedVR2NativeRawDiTProbe:
                 return normalized
 
             seedvr_model.CustomRMSNorm.forward = fp32_norm_forward
+        if capture_blocks:
+            original_var_attention = seedvr_model.optimized_var_attention
+            captured_var_attention = {"done": False}
+
+            def probe_var_attention(*args, **kwargs):
+                q = kwargs.get("q", args[0] if len(args) > 0 else None)
+                k = kwargs.get("k", args[1] if len(args) > 1 else None)
+                v = kwargs.get("v", args[2] if len(args) > 2 else None)
+                if not captured_var_attention["done"]:
+                    if q is not None:
+                        submodule_probes.append({"stage": "block_0.attn.var.q", "vid": _debug_tensor_probe(q)})
+                    if k is not None:
+                        submodule_probes.append({"stage": "block_0.attn.var.k", "vid": _debug_tensor_probe(k)})
+                    if v is not None:
+                        submodule_probes.append({"stage": "block_0.attn.var.v", "vid": _debug_tensor_probe(v)})
+                out = original_var_attention(*args, **kwargs)
+                if not captured_var_attention["done"]:
+                    submodule_probes.append({"stage": "block_0.attn.var.out", "vid": _debug_tensor_probe(out)})
+                    captured_var_attention["done"] = True
+                return out
+
+            seedvr_model.optimized_var_attention = probe_var_attention
 
         with torch.no_grad():
             try:
@@ -2468,6 +2497,8 @@ class SeedVR2NativeRawDiTProbe:
             finally:
                 if original_norm_forward is not None:
                     seedvr_model.CustomRMSNorm.forward = original_norm_forward
+                if original_var_attention is not None:
+                    seedvr_model.optimized_var_attention = original_var_attention
                 for handle in hook_handles:
                     handle.remove()
         raw_pred = x_t.float() - denoised.float()
@@ -2942,8 +2973,24 @@ class SeedVR2NumzRawDiTFromNativeProbe:
                 add_submodule_probe("block_0.attn_norm", block0.attn_norm)
                 add_submodule_probe("block_0.ada", block0.ada)
                 add_submodule_probe("block_0.attn", block0.attn)
+                add_submodule_probe("block_0.attn.proj_qkv", block0.attn.proj_qkv)
+                add_submodule_probe("block_0.attn.norm_q", block0.attn.norm_q)
+                add_submodule_probe("block_0.attn.norm_k", block0.attn.norm_k)
+                if block0.attn.rope is not None:
+                    add_submodule_probe("block_0.attn.rope", block0.attn.rope)
+                add_submodule_probe("block_0.attn.proj_out", block0.attn.proj_out)
                 add_submodule_probe("block_0.mlp_norm", block0.mlp_norm)
                 add_submodule_probe("block_0.mlp", block0.mlp)
+
+                def attention_call_probe(module, inputs, kwargs, output):
+                    for key in ("q", "k", "v"):
+                        value = kwargs.get(key)
+                        if value is not None:
+                            submodule_probes.append({"stage": f"block_0.attn.var.{key}", "vid": _debug_tensor_probe(value)})
+                    submodule_probes.append({"stage": "block_0.attn.var.out", "vid": _debug_tensor_probe(output)})
+
+                if hasattr(block0.attn, "attn"):
+                    hook_handles.append(block0.attn.attn.register_forward_hook(attention_call_probe, with_kwargs=True))
 
                 def pre_block_0(module, inputs, kwargs):
                     block_probes.append({"stage": "block_0_in", "vid": _debug_tensor_probe(kwargs["vid"])})
