@@ -2752,7 +2752,8 @@ class SeedVR2NumzRawDiTFromNativeProbe:
         _ensure_numz_import_path()
         import torch
 
-        from src.core.generation_utils import prepare_runner, setup_generation_context
+        from src.core.generation_utils import ensure_precision_initialized, prepare_runner, setup_generation_context
+        from src.core.model_loader import materialize_model
         from src.optimization.memory_manager import cleanup_text_embeddings, complete_cleanup, manage_model_device
         from src.utils.constants import get_base_cache_dir
         from src.utils.debug import Debug
@@ -2812,6 +2813,9 @@ class SeedVR2NumzRawDiTFromNativeProbe:
                 torch_compile_args_vae=vae.get("torch_compile_args"),
             )
             ctx["cache_context"] = cache_context
+            if runner.dit and next(runner.dit.parameters()).device.type == "meta":
+                materialize_model(runner, "dit", ctx["dit_device"], runner.config, debug)
+            ensure_precision_initialized(ctx, runner, debug)
             manage_model_device(
                 model=runner.dit,
                 target_device=ctx["dit_device"],
