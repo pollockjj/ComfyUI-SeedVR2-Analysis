@@ -2310,6 +2310,136 @@ def _native_latent_to_numz_latent(latent: dict[str, Any]) -> Any:
     return samples[0].movedim(0, -1).contiguous()
 
 
+def _debug_tensor_stats(tensor: Any) -> dict[str, Any]:
+    import torch
+
+    if not torch.is_tensor(tensor):
+        raise TypeError(f"expected tensor, got {type(tensor).__name__}")
+    t = tensor.detach().float()
+    return {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype).replace("torch.", ""),
+        "device": str(tensor.device),
+        "mean": float(t.mean().item()),
+        "std": float(t.std(unbiased=False).item()),
+        "min": float(t.min().item()),
+        "max": float(t.max().item()),
+    }
+
+
+class SeedVR2NativeRawDiTProbe:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "latent_image": ("LATENT",),
+                "seed": ("INT", {"default": 5770521, "min": 0, "max": 2**32 - 1, "step": 1}),
+                "output_path": (
+                    "STRING",
+                    {
+                        "default": "/home/johnj/dev_master/mydevelopment/github_issues/283/scratch/divergence_probe/native_raw_dit_probe.pt",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "execute"
+    CATEGORY = "SEEDVR2/debug"
+    OUTPUT_NODE = True
+
+    def execute(self, model, positive, latent_image, seed, output_path):
+        import torch
+        import comfy.model_management
+        import comfy.sample
+
+        path = Path(output_path)
+        if "/scratch/" not in str(path):
+            raise ValueError(f"SeedVR2NativeRawDiTProbe output_path must be under a scratch directory: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not positive:
+            raise ValueError("SeedVR2NativeRawDiTProbe requires non-empty positive conditioning")
+        context = positive[0][0]
+        cond_meta = positive[0][1]
+        if "condition" not in cond_meta:
+            raise ValueError("SeedVR2NativeRawDiTProbe positive conditioning is missing 'condition'")
+        condition = cond_meta["condition"]
+
+        samples = latent_image["samples"]
+        samples = comfy.sample.fix_empty_latent_channels(
+            model,
+            samples,
+            latent_image.get("downscale_ratio_spacial", None),
+            latent_image.get("downscale_ratio_temporal", None),
+        )
+        noise = comfy.sample.prepare_noise(samples, seed, latent_image.get("batch_index", None))
+
+        comfy.model_management.load_models_gpu([model], force_full_load=True)
+        device = model.load_device
+        x_t = noise.to(device=device)
+        sigma = torch.ones([x_t.shape[0]], device=device, dtype=torch.float32)
+        context = context.to(device=device)
+        condition = condition.to(device=device)
+
+        with torch.no_grad():
+            denoised = model.model.apply_model(
+                x_t,
+                sigma,
+                c_crossattn=context,
+                transformer_options={"cond_or_uncond": [0]},
+                condition=condition,
+            )
+        raw_pred = x_t.float() - denoised.float()
+
+        artifact = {
+            "schema": "seedvr2_native_raw_dit_probe.v1",
+            "seed": seed,
+            "sampler_edge": {
+                "sigma": [float(v) for v in sigma.detach().cpu().tolist()],
+                "scheduler": "simple",
+                "sampler": "euler",
+                "steps": 1,
+                "raw_pred_reconstruction": "x_t - denoised at sigma=1",
+            },
+            "stats": {
+                "x_t": _debug_tensor_stats(x_t),
+                "condition": _debug_tensor_stats(condition),
+                "context": _debug_tensor_stats(context),
+                "denoised": _debug_tensor_stats(denoised),
+                "raw_pred": _debug_tensor_stats(raw_pred),
+            },
+            "tensors": {
+                "x_t": x_t.detach().cpu(),
+                "condition": condition.detach().cpu(),
+                "context": context.detach().cpu(),
+                "denoised": denoised.detach().cpu(),
+                "raw_pred": raw_pred.detach().cpu(),
+            },
+        }
+        torch.save(artifact, path)
+
+        sidecar = path.with_suffix(".json")
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "path": str(path),
+                    "sha256": _file_sha256(path),
+                    "schema": artifact["schema"],
+                    "seed": seed,
+                    "stats": artifact["stats"],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return (str(sidecar),)
+
+
 class SeedVR2NumzPreparedConditioningToNative:
     @classmethod
     def INPUT_TYPES(cls):
@@ -2593,6 +2723,7 @@ NODE_CLASS_MAPPINGS = {
     "SeedVR2NumzPreparedConditioningToNative": SeedVR2NumzPreparedConditioningToNative,
     "SeedVR2NumzUpscaledLatentFileToNative": SeedVR2NumzUpscaledLatentFileToNative,
     "SeedVR2NativeLatentToNumzDiT": SeedVR2NativeLatentToNumzDiT,
+    "SeedVR2NativeRawDiTProbe": SeedVR2NativeRawDiTProbe,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2Analysis": "SeedVR2 Analysis",
@@ -2601,4 +2732,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2NumzPreparedConditioningToNative": "SeedVR2 Numz Prepared Conditioning -> Native",
     "SeedVR2NumzUpscaledLatentFileToNative": "SeedVR2 Numz Upscaled Latent File -> Native",
     "SeedVR2NativeLatentToNumzDiT": "SeedVR2 Native Latent -> Numz DiT",
+    "SeedVR2NativeRawDiTProbe": "SeedVR2 Native Raw DiT Probe",
 }
