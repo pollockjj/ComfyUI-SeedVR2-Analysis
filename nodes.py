@@ -935,6 +935,7 @@ class SeedVR2Analysis:
 EQUIVALENCE_SCHEMA_VERSION = "2.2"
 WORST_FRAME_SCHEMA_VERSION = "1.0"
 IMAGE_COMPARISON_SCHEMA_VERSION = "1.0"
+IMAGE_REFERENCE_SCHEMA_VERSION = "1.0"
 FAST_VISUAL_FIDELITY_METRICS = ("psnr", "ssim", "lpips", "dists")
 
 # Direction: True iff higher metric value = better quality.
@@ -1250,6 +1251,136 @@ class SeedVR2ImageComparisonAnalysis:
             "raw_metrics": leg_metrics,
             "metric_wins": wins,
             "verdict": verdict,
+            "tool_provenance": SeedVR2WorstFrameFidelityAnalysis._tool_provenance(),
+        }
+        metrics_json = json.dumps(metrics_doc, indent=2)
+        artifact_path.write_text(metrics_json, encoding="utf-8")
+        return (metrics_json, str(artifact_path), summary)
+
+
+class SeedVR2ImageReferenceAnalysis(SeedVR2ImageComparisonAnalysis):
+    """Full-reference statistics for one SeedVR2 still-image output."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "reference": ("IMAGE",),
+                "image": ("IMAGE",),
+            },
+            "optional": {
+                "image_label": ("STRING", {"default": "image"}),
+                "lpips_backbone": (["alex", "vgg"], {"default": "alex"}),
+                "enable_psnr": ("BOOLEAN", {"default": True}),
+                "enable_ssim": ("BOOLEAN", {"default": True}),
+                "enable_lpips": ("BOOLEAN", {"default": True}),
+                "enable_dists": ("BOOLEAN", {"default": True}),
+                "enable_color_metrics": ("BOOLEAN", {"default": False}),
+                "output_directory": ("STRING", {"default": ""}),
+                "output_filename": ("STRING", {"default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("metrics_json", "artifact_path", "summary")
+    FUNCTION = "analyze"
+    CATEGORY = "image/analysis"
+    OUTPUT_NODE = True
+
+    def analyze(
+        self,
+        reference,
+        image,
+        image_label: str = "image",
+        lpips_backbone: str = "alex",
+        enable_psnr: bool = True,
+        enable_ssim: bool = True,
+        enable_lpips: bool = True,
+        enable_dists: bool = True,
+        enable_color_metrics: bool = False,
+        output_directory: str = "",
+        output_filename: str = "",
+    ):
+        label = image_label.strip() or "image"
+        if label == "reference":
+            raise ValueError("image_label must be distinct from 'reference'")
+
+        if output_directory.strip():
+            artifact_dir = Path(output_directory).expanduser().resolve()
+        else:
+            artifact_dir = self._artifact_dir()
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        if output_filename.strip():
+            fname = output_filename.strip()
+            if not fname.lower().endswith(".json"):
+                fname = fname + ".json"
+        else:
+            fname = f"seedvr2_image_reference_{uuid.uuid4().hex}.json"
+        artifact_path = artifact_dir / fname
+
+        normalized = self._normalize_inputs({
+            "reference": reference,
+            label: image,
+        })
+        reference_rgb, reference_alpha = normalized["reference"]
+        image_rgb, image_alpha = normalized[label]
+        height, width = reference_rgb.shape[1:3]
+        batch_count = reference_rgb.shape[0]
+        enabled = self._enabled_metrics(
+            enable_psnr,
+            enable_ssim,
+            enable_lpips,
+            enable_dists,
+            enable_color_metrics,
+        )
+        backend = self._metric_backend or SeedVR2MetricBackend(lpips_backbone=lpips_backbone)
+        raw_metrics = self._score_images(
+            backend,
+            image_rgb,
+            image_alpha,
+            reference_rgb,
+            reference_alpha,
+            enabled,
+        )
+
+        metric_names = [m for m in FR_METRIC_NAMES if m in raw_metrics]
+        if reference_alpha is not None:
+            metric_names.extend([m for m in ("alpha_mae", "alpha_psnr") if m in raw_metrics])
+
+        rows = []
+        for metric_name in metric_names:
+            block = raw_metrics[metric_name]
+            rows.append({
+                "metric": metric_name,
+                "direction": "higher" if METRIC_HIGHER_IS_BETTER[metric_name] else "lower",
+                "mean": float(block["mean"]),
+                "std": float(block["std"]),
+                "min": float(block["min"]),
+                "max": float(block["max"]),
+                "per_frame": [float(v) for v in block["per_frame"]],
+            })
+
+        summary = " ".join(
+            f"{row['metric']}={row['mean']:.6g}"
+            for row in rows
+            if row["metric"] in FAST_VISUAL_FIDELITY_METRICS
+        )
+        metrics_doc = {
+            "schema_version": IMAGE_REFERENCE_SCHEMA_VERSION,
+            "node": "SeedVR2ImageReferenceAnalysis",
+            "inputs": {
+                "reference": self._image_label(reference),
+                label: self._image_label(image),
+            },
+            "images": {
+                "batch_count": int(batch_count),
+                "width": int(width),
+                "height": int(height),
+                "reference_has_alpha": reference_alpha is not None,
+            },
+            "enabled_metrics": sorted(enabled),
+            "metrics": rows,
+            "raw_metrics": raw_metrics,
             "tool_provenance": SeedVR2WorstFrameFidelityAnalysis._tool_provenance(),
         }
         metrics_json = json.dumps(metrics_doc, indent=2)
@@ -3446,6 +3577,7 @@ class SeedVR2NumzRawDiTFromNativeProbe:
 NODE_CLASS_MAPPINGS = {
     "SeedVR2Analysis": SeedVR2Analysis,
     "SeedVR2ImageComparisonAnalysis": SeedVR2ImageComparisonAnalysis,
+    "SeedVR2ImageReferenceAnalysis": SeedVR2ImageReferenceAnalysis,
     "SeedVR2EquivalenceAnalysis": SeedVR2EquivalenceAnalysis,
     "SeedVR2WorstFrameFidelityAnalysis": SeedVR2WorstFrameFidelityAnalysis,
     "SeedVR2NumzPreparedConditioningToNative": SeedVR2NumzPreparedConditioningToNative,
@@ -3457,6 +3589,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2Analysis": "SeedVR2 Analysis",
     "SeedVR2ImageComparisonAnalysis": "SeedVR2 Image Comparison Analysis",
+    "SeedVR2ImageReferenceAnalysis": "SeedVR2 Image Reference Analysis",
     "SeedVR2EquivalenceAnalysis": "SeedVR2 Equivalence Analysis (BEST + ROPE)",
     "SeedVR2WorstFrameFidelityAnalysis": "SeedVR2 Worst-Frame Fidelity Analysis",
     "SeedVR2NumzPreparedConditioningToNative": "SeedVR2 Numz Prepared Conditioning -> Native",

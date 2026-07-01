@@ -2,6 +2,7 @@ from .nodes import (
     SeedVR2Analysis,
     SeedVR2EquivalenceAnalysis,
     SeedVR2ImageComparisonAnalysis,
+    SeedVR2ImageReferenceAnalysis,
     SeedVR2NativeLatentToNumzDiT,
     SeedVR2NativeRawDiTProbe,
     SeedVR2NumzRawDiTFromNativeProbe,
@@ -13,6 +14,7 @@ from .nodes import (
 NODE_CLASS_MAPPINGS = {
     "SeedVR2Analysis": SeedVR2Analysis,
     "SeedVR2ImageComparisonAnalysis": SeedVR2ImageComparisonAnalysis,
+    "SeedVR2ImageReferenceAnalysis": SeedVR2ImageReferenceAnalysis,
     "SeedVR2EquivalenceAnalysis": SeedVR2EquivalenceAnalysis,
     "SeedVR2WorstFrameFidelityAnalysis": SeedVR2WorstFrameFidelityAnalysis,
     "SeedVR2NumzPreparedConditioningToNative": SeedVR2NumzPreparedConditioningToNative,
@@ -25,6 +27,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2Analysis": "SeedVR2 Analysis",
     "SeedVR2ImageComparisonAnalysis": "SeedVR2 Image Comparison Analysis",
+    "SeedVR2ImageReferenceAnalysis": "SeedVR2 Image Reference Analysis",
     "SeedVR2EquivalenceAnalysis": "SeedVR2 Equivalence Analysis (BEST + ROPE)",
     "SeedVR2WorstFrameFidelityAnalysis": "SeedVR2 Worst-Frame Fidelity Analysis",
     "SeedVR2NumzPreparedConditioningToNative": "SeedVR2 Numz Prepared Conditioning -> Native",
