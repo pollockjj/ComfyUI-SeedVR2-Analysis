@@ -934,6 +934,7 @@ class SeedVR2Analysis:
 
 EQUIVALENCE_SCHEMA_VERSION = "2.2"
 WORST_FRAME_SCHEMA_VERSION = "1.0"
+VIDEO_REFERENCE_SCHEMA_VERSION = "1.0"
 IMAGE_COMPARISON_SCHEMA_VERSION = "1.0"
 IMAGE_REFERENCE_SCHEMA_VERSION = "1.0"
 FAST_VISUAL_FIDELITY_METRICS = ("psnr", "ssim", "lpips", "dists")
@@ -1378,6 +1379,149 @@ class SeedVR2ImageReferenceAnalysis(SeedVR2ImageComparisonAnalysis):
                 "height": int(height),
                 "reference_has_alpha": reference_alpha is not None,
             },
+            "enabled_metrics": sorted(enabled),
+            "metrics": rows,
+            "raw_metrics": raw_metrics,
+            "tool_provenance": SeedVR2WorstFrameFidelityAnalysis._tool_provenance(),
+        }
+        metrics_json = json.dumps(metrics_doc, indent=2)
+        artifact_path.write_text(metrics_json, encoding="utf-8")
+        return (metrics_json, str(artifact_path), summary)
+
+
+class SeedVR2VideoReferenceAnalysis:
+    """Full-reference statistics for one SeedVR2 movie output."""
+
+    def __init__(self, metric_backend=None):
+        self._metric_backend = metric_backend
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "reference": ("VIDEO",),
+                "input": ("VIDEO",),
+            },
+            "optional": {
+                "input_label": ("STRING", {"default": "input"}),
+                "lpips_backbone": (["alex", "vgg"], {"default": "alex"}),
+                "enable_psnr": ("BOOLEAN", {"default": True}),
+                "enable_ssim": ("BOOLEAN", {"default": True}),
+                "enable_lpips": ("BOOLEAN", {"default": True}),
+                "enable_dists": ("BOOLEAN", {"default": True}),
+                "enable_color_metrics": ("BOOLEAN", {"default": False}),
+                "output_directory": ("STRING", {"default": ""}),
+                "output_filename": ("STRING", {"default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("metrics_json", "artifact_path", "summary")
+    FUNCTION = "analyze"
+    CATEGORY = "video/analysis"
+    OUTPUT_NODE = True
+
+    @staticmethod
+    def _artifact_dir() -> Path:
+        return SeedVR2Analysis._artifact_dir()
+
+    @staticmethod
+    def _video_label(value) -> str:
+        return repr(type(value).__name__) if _is_video_object(value) else str(value)
+
+    @staticmethod
+    def _enabled_metrics(enable_psnr, enable_ssim, enable_lpips, enable_dists, enable_color_metrics) -> set[str]:
+        enabled: set[str] = set()
+        if enable_psnr:
+            enabled.add("psnr")
+        if enable_ssim:
+            enabled.add("ssim")
+        if enable_lpips:
+            enabled.add("lpips")
+        if enable_dists:
+            enabled.add("dists")
+        if enable_color_metrics:
+            enabled.update(COLOR_METRIC_NAMES)
+        return enabled
+
+    def analyze(
+        self,
+        reference,
+        input,
+        input_label: str = "input",
+        lpips_backbone: str = "alex",
+        enable_psnr: bool = True,
+        enable_ssim: bool = True,
+        enable_lpips: bool = True,
+        enable_dists: bool = True,
+        enable_color_metrics: bool = False,
+        output_directory: str = "",
+        output_filename: str = "",
+    ):
+        label = input_label.strip() or "input"
+        if label == "reference":
+            raise ValueError("input_label must be distinct from 'reference'")
+
+        if output_directory.strip():
+            artifact_dir = Path(output_directory).expanduser().resolve()
+        else:
+            artifact_dir = self._artifact_dir()
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        if output_filename.strip():
+            fname = output_filename.strip()
+            if not fname.lower().endswith(".json"):
+                fname = fname + ".json"
+        else:
+            fname = f"seedvr2_video_reference_{uuid.uuid4().hex}.json"
+        artifact_path = artifact_dir / fname
+
+        ref_frames, ref_fps = _frames_from_video(reference)
+        input_frames, input_fps = _frames_from_video(input)
+        ref_meta = SeedVR2Analysis._alignment_metadata(ref_frames, ref_fps)
+        input_meta = SeedVR2Analysis._alignment_metadata(input_frames, input_fps)
+        alignment = SeedVR2Analysis._assert_reference_alignment(input_meta, ref_meta)
+        enabled = self._enabled_metrics(
+            enable_psnr,
+            enable_ssim,
+            enable_lpips,
+            enable_dists,
+            enable_color_metrics,
+        )
+
+        backend = self._metric_backend or SeedVR2MetricBackend(lpips_backbone=lpips_backbone)
+        raw_metrics = backend.compute_fr_metrics(input_frames, ref_frames, enabled=enabled)
+        rows = []
+        for metric_name in FR_METRIC_NAMES:
+            if metric_name not in raw_metrics:
+                continue
+            block = raw_metrics[metric_name]
+            rows.append({
+                "metric": metric_name,
+                "direction": "higher" if METRIC_HIGHER_IS_BETTER[metric_name] else "lower",
+                "mean": float(block["mean"]),
+                "std": float(block["std"]),
+                "min": float(block["min"]),
+                "max": float(block["max"]),
+                "per_frame": [float(v) for v in block["per_frame"]],
+            })
+
+        summary = " ".join(
+            f"{row['metric']}={row['mean']:.6g}"
+            for row in rows
+            if row["metric"] in FAST_VISUAL_FIDELITY_METRICS
+        )
+        metrics_doc = {
+            "schema_version": VIDEO_REFERENCE_SCHEMA_VERSION,
+            "node": "SeedVR2VideoReferenceAnalysis",
+            "inputs": {
+                "reference": self._video_label(reference),
+                label: self._video_label(input),
+            },
+            "videos": {
+                "reference": ref_meta,
+                label: input_meta,
+            },
+            "alignment": alignment,
             "enabled_metrics": sorted(enabled),
             "metrics": rows,
             "raw_metrics": raw_metrics,
@@ -3578,6 +3722,7 @@ NODE_CLASS_MAPPINGS = {
     "SeedVR2Analysis": SeedVR2Analysis,
     "SeedVR2ImageComparisonAnalysis": SeedVR2ImageComparisonAnalysis,
     "SeedVR2ImageReferenceAnalysis": SeedVR2ImageReferenceAnalysis,
+    "SeedVR2VideoReferenceAnalysis": SeedVR2VideoReferenceAnalysis,
     "SeedVR2EquivalenceAnalysis": SeedVR2EquivalenceAnalysis,
     "SeedVR2WorstFrameFidelityAnalysis": SeedVR2WorstFrameFidelityAnalysis,
     "SeedVR2NumzPreparedConditioningToNative": SeedVR2NumzPreparedConditioningToNative,
@@ -3590,6 +3735,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2Analysis": "SeedVR2 Analysis",
     "SeedVR2ImageComparisonAnalysis": "SeedVR2 Image Comparison Analysis",
     "SeedVR2ImageReferenceAnalysis": "SeedVR2 Image Reference Analysis",
+    "SeedVR2VideoReferenceAnalysis": "SeedVR2 Video Reference Analysis",
     "SeedVR2EquivalenceAnalysis": "SeedVR2 Equivalence Analysis (BEST + ROPE)",
     "SeedVR2WorstFrameFidelityAnalysis": "SeedVR2 Worst-Frame Fidelity Analysis",
     "SeedVR2NumzPreparedConditioningToNative": "SeedVR2 Numz Prepared Conditioning -> Native",
